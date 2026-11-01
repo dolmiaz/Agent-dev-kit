@@ -4,7 +4,8 @@
 #   setup-deps.sh deps     言語ごとの依存(ロックが変わらず成果物もそろっていればスキップ)
 #   setup-deps.sh extras   ブラウザ(Playwright)など、使っているときだけ
 #   setup-deps.sh all      deps + extras
-#   setup-deps.sh check    何が検出されるか表示(何も入れない)
+#   setup-deps.sh check    必要な CLI と導入済み設定の形式を読み取り専用で点検
+#   setup-deps.sh doctor   check と同じ(値・絶対パスを表示せず、状態も作らない)
 #   setup-deps.sh plan     必要な CLI・接続先・サービスの一覧(導入前の確認用。何も入れない)
 #
 # 方針:
@@ -15,7 +16,19 @@
 set -u
 set -o pipefail
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF_PARENT="${BASH_SOURCE[0]%/*}"
+[ "$SELF_PARENT" != "${BASH_SOURCE[0]}" ] || SELF_PARENT=.
+[ -n "$SELF_PARENT" ] || SELF_PARENT=/
+SELF_DIR="$(cd -- "$SELF_PARENT" 2>/dev/null && pwd)" || { echo 'invalid: setup installation' >&2; exit 1; }
+# Read-only diagnostics must run before config loading or state/lock creation.
+case "${1:-}" in
+  check|doctor)
+    [ "$#" -eq 1 ] || { echo 'usage: setup-deps.sh {check|doctor}' >&2; exit 2; }
+    command -v python3 >/dev/null 2>&1 || { echo 'missing: tool python3'; exit 1; }
+    [ -f "$SELF_DIR/../lib/agentdoctor.py" ] || { echo 'invalid: doctor installation'; exit 1; }
+    exec python3 -B "$SELF_DIR/../lib/agentdoctor.py"
+    ;;
+esac
 # shellcheck source=../lib/common.sh
 . "$SELF_DIR/../lib/common.sh"
 REPO_ROOT="$(agent_repo_root)"
@@ -223,24 +236,6 @@ docker_images() {
   stamp_set docker "$key"
 }
 
-# ---- 表示 ------------------------------------------------------------------
-check() {
-  echo "runtime: $(agent_runtime)   service: $(agent_service)"
-  echo "repo:    $REPO_ROOT"
-  echo "state:   $(agent_state_dir)"
-  local f
-  for f in package.json pnpm-lock.yaml yarn.lock package-lock.json bun.lock bun.lockb .nvmrc .node-version \
-           uv.lock poetry.lock pyproject.toml requirements.txt .python-version go.mod Cargo.lock \
-           Gemfile.lock composer.lock gradlew pom.xml compose.yaml docker-compose.yml .tool-versions; do
-    [ -e "$f" ] && echo "found:   $f"
-  done
-  if uses_playwright; then echo "playwright: yes"; else echo "playwright: no"; fi
-  for f in node npm pnpm yarn bun python3 uv poetry go cargo bundle composer docker psql redis-server gh; do
-    have "$f" && echo "tool:    $f"
-  done
-  return 0
-}
-
 # plan: 導入前にまとめて確認するための一覧(CLI・接続先・サービス)
 plan() {
   local clis=() domains=() services=() notes=()
@@ -296,10 +291,9 @@ plan() {
 main() {
   local cmd="${1:-all}"
   case "$cmd" in
-    check) check; return 0 ;;
     plan) plan; return 0 ;;
     deps|extras|all) ;;
-    *) echo "usage: $0 {deps|extras|all|check|plan}" >&2; return 2 ;;
+    *) echo "usage: $0 {deps|extras|all|check|doctor|plan}" >&2; return 2 ;;
   esac
   local t0; t0=$(date +%s)
   if [ "$cmd" = deps ] || [ "$cmd" = all ]; then
