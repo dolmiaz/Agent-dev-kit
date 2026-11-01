@@ -109,5 +109,5 @@ python3 tools/publish-check.py . --history
 - 個人設定、送信キー、Drive フォルダ ID、既存 Git 履歴、個人スキルの実体は含まない。
 - 作業ログ送信は利用者が送信先と認証を設定してから使う。自動的に第三者の送信先へ接続する初期値はない。
 - Gemini 推敲は元設計どおり公開前のゲート。送信同意・認証・モデル・CLI 版が未設定なら送信せず公開を保留する。詳細は [docs/10](docs/10-publish-polish.md)。
-- ライセンスはまだ選定していない。[LICENSE-NOTICE.md](LICENSE-NOTICE.md) を参照。公開されていることと再利用の許諾は別。
+- このプロジェクトのコードと文書は [MIT License](LICENSE)。第三者素材の権利とテスト用のライセンス表記については [LICENSE-NOTICE.md](LICENSE-NOTICE.md) を参照。
 - 秘密情報検査の限界と事故時の対応は [SECURITY.md](SECURITY.md) を参照。

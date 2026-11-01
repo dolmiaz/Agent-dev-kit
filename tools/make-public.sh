@@ -9,7 +9,7 @@ OUT="${1:?出力先のディレクトリを指定する}"
 [ ! -e "$OUT" ] || [ -z "$(ls -A "$OUT" 2>/dev/null)" ] || { echo "出力先が空でない: $OUT" >&2; exit 2; }
 mkdir -p "$OUT"
 
-INCLUDE=(README.md PUBLISH.md SECURITY.md LICENSE-NOTICE.md .gitignore .github install.py kit endpoint/Code.gs endpoint/appsscript.json endpoint/Deny.gs.example
+INCLUDE=(README.md PUBLISH.md SECURITY.md LICENSE LICENSE-NOTICE.md .gitignore .github install.py kit endpoint/Code.gs endpoint/appsscript.json endpoint/Deny.gs.example
          local skills/skillsync.py skills/bundle-template tests tools
          docs/01-codex-cloud-settings.md docs/02-claude-code-web-settings.md docs/03-network-packages-permissions.md
          docs/04-identity-signing-secrets.md docs/05-worklog-to-obsidian.md docs/06-manual-setup.md
@@ -25,7 +25,7 @@ EXTRA=()
 [ -f "$SRC/personal/publish-deny.local.txt" ] && EXTRA=(--extra "$SRC/personal/publish-deny.local.txt")
 if python3 "$SRC/tools/publish-check.py" "$OUT" "${EXTRA[@]}"; then
   echo "公開用の写しを作った: $OUT"
-  echo "次(本人が判断): ライセンスを決めて LICENSE を置き、cd '$OUT' && git init && git add -A && git commit。"
+  echo "次(本人が判断): LICENSE と権利表記を確認し、cd '$OUT' && git init && git add -A && git commit。"
   echo "元のリポジトリの履歴は公開しない(個人の値を含むため)。"
 else
   echo "公開しない: 上の項目を直してから作り直す($OUT は確認用に残す)" >&2

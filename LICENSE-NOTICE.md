@@ -1,6 +1,8 @@
-# License status
+# License and third-party notices
 
-An open-source license has not yet been selected for this project. Publishing the source does not by itself grant permission to reuse, modify, or redistribute it. No MIT, Apache, or other license is implied.
+This project's original code and documentation are available under the MIT License. See [LICENSE](LICENSE) for the full terms and copyright notice.
+
+Third-party materials retain their own copyright, license, attribution, and redistribution requirements. The project's MIT License does not relicense them or remove required notices.
 
 Personal skill bundles and their source repositories are not included. Before importing or vendoring a third-party skill, verify its upstream source, license, and redistribution requirements. Preserve required notices.
 

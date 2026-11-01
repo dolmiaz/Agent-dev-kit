@@ -23,11 +23,13 @@ bash tools/make-public.sh <出力先>      # 写す → 点検 → 通ったと�
 | `local/`(フォルダ ID は設定ファイルから読む) | `~/.config/agent-kit/collector.json`(手元の設定) |
 | `skills/skillsync.py`・`skills/bundle-template/` | スキルの正本と個人スキルそのもの |
 | `tests/`(値は架空)、`tools/` | `reports/`(検証の記録・テストのログ) |
+| `LICENSE`、`LICENSE-NOTICE.md`(ライセンスと権利の説明) | 非公開の契約・個人記録 |
 | `docs/01`〜`06`、`08`〜`10`、`sources.md`、公開用の安全・ライセンス状態の説明 | 元のリポジトリの git 履歴 |
 
-## 本人が決めること
+## 公開先とライセンス
 
-- キットのライセンス(LICENSE を置く)。
+- このプロジェクトのコードと文書は MIT License。公開用の写しにも `LICENSE` と `LICENSE-NOTICE.md` を含め、著作権表示と許諾文を保持する。
+- 第三者素材は元のライセンスと権利表記を保持する。キットの MIT License に変更しない。
 - 公開先のリポジトリ(公開リポジトリの作成は本人の操作)。
 
 ## 個人スキルについて
