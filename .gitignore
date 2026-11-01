@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+personal/
+reports/
+.agent-logs/
+skills.lock.json
+skills.lock.prev.json
+node_modules/
+.venv/
+venv/
+*.pem
+*.key

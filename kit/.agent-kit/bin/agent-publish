@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""agent-publish — 対外文章(PR のタイトル・本文、リリースノート、README)を Gemini で推敲してから公開する共通の入口
+(Codex・Claude Code の両方が使う)。
+
+  推敲
+    polish --kind pr-title|pr-body|release-notes|readme --file F [--facts F] [--path README.md]
+                        下書きを検査し、Gemini で推敲し、変えてはいけないものが同じか確かめて記録する(ID を出す)
+    retry <ID>          保留・不採用になった推敲をもう一度(回数の上限 AGENT_GEMINI_MAX_ATTEMPTS)
+    revise <ID> --file F 推敲稿を作成側が直したとき、下書きと照らして検証し直す(確認はやり直し)
+    confirm <ID> --reviewed-diff [--note T]
+                        作成側エージェントが差分を読み、内容(数値・機能の有無・試験結果)が変わっていないと確かめた記録
+    show <ID> / list    記録と差分
+    apply <ID>          README などを、確認済みの本文でリポジトリのファイルに書く(kind readme)
+  公開(確認済みの記録の本文だけを使う。本文のハッシュが記録と違えば止まる)
+    pr-create --issue N --branch B --title-id ID --body-id ID [--agent A] [--session S] [--no-draft]
+    pr-edit <PR> [--title-id ID] [--body-id ID]
+    release <TAG> --notes-id ID [--title-id ID] [--publish]       既定は下書き(draft)のリリース
+    push [REMOTE] [BRANCH]       push で公開される README 等が確認済みかを確かめてから git push(オプションは付けない)
+    check-push [REMOTE] [BRANCH] 確かめるだけ(hook が使う)
+
+終了コード: 0 成功 / 2 使い方・前提 / 3 保留(Gemini が使えない・未確認。下書きは残っている) / 4 不採用(秘密・差分の検査)
+            / 5 GitHub・git の失敗
+推敲は、技術レビュー・Opus のレビュー・PR の承認・マージ判断の代わりにはならない。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import secrets
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+LIB = Path(__file__).resolve().parents[1] / "lib"
+sys.path.insert(0, str(LIB))
+
+import agentpub as P  # noqa: E402
+
+EXIT_HOLD, EXIT_REJECT, EXIT_GH = 3, 4, 5
+
+
+def root() -> Path:
+    """今いるリポジトリ(環境変数 AGENT_REPO_ROOT では決めない。確かめる場所と push する場所を同じにする)"""
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+    return Path(r or os.getcwd()).resolve()
+
+
+def evidence(argv) -> dict:
+    try:
+        from agentgh import review
+        return review.own_evidence(argv, tool="agent-publish")
+    except Exception:
+        return {}
+
+
+# --- 推敲 ---------------------------------------------------------------------------
+def _attempt(R: Path, cfg: dict, rec: dict) -> int:
+    draft, facts = P.text_of(rec, "draft.md"), P.text_of(rec, "facts.md")
+    rec["attempts"] = rec.get("attempts", 0) + 1
+    rec.pop("hold_reason", None)
+    try:
+        polished, info = P.run_gemini(cfg, rec["kind"], draft, facts)
+    except P.Hold as h:
+        rec.update(status="held", hold_kind=h.kind, hold_reason=str(h), updated_at=P._now())
+        rec.setdefault("history", []).append({"at": P._now(), "result": f"held:{h.kind}"})
+        P.save(R, rec)
+        print(f"保留: {h}\n  下書きはそのまま残っている(記録 {rec['id']})。直ったら agent-publish retry {rec['id']}。"
+              "管理対象の公開(PR・リリース・README の push)だけが止まる", file=sys.stderr)
+        return EXIT_HOLD
+    rec["gemini"] = info
+    return _check_and_store(R, cfg, rec, polished, "Gemini の推敲")
+
+
+def _check_and_store(R: Path, cfg: dict, rec: dict, text: str, how: str) -> int:
+    draft = P.text_of(rec, "draft.md")
+    if rec["kind"] == "pr-title":
+        text = " ".join(text.split())
+    bad, warn = P.compare(draft, text)
+    leaks = P.scan(text, cfg)
+    d = Path(rec["_dir"])
+    (d / "candidate.md").write_text(text, encoding="utf-8")
+    rec.setdefault("history", []).append({"at": P._now(), "result": "checked", "how": how,
+                                          "violations": bad, "warnings": warn, "leaks": leaks})
+    if bad or leaks:
+        rec.update(status="rejected", hold_reason="; ".join(bad + [f"秘密・非公開の情報らしいもの: {x}" for x in leaks]),
+                   updated_at=P._now())
+        P.save(R, rec)
+        print(f"不採用: {how}の結果は使わない(記録 {rec['id']})", file=sys.stderr)
+        for b in bad + leaks:
+            print(f"  - {b}", file=sys.stderr)
+        print(f"  agent-publish retry {rec['id']} で推敲し直すか、下書きを直して polish からやり直す", file=sys.stderr)
+        return EXIT_REJECT
+    (d / "final.md").write_text(text, encoding="utf-8")
+    rec.update(status="polished", final_sha256=P.sha256(text), warnings=warn, updated_at=P._now())
+    rec.pop("confirm", None)
+    P.save(R, rec)
+    print(P.unified_diff(draft, text) or "(差分なし)")
+    for w in warn:
+        print(f"注意: {w}", file=sys.stderr)
+    print(f"推敲稿: {d / 'final.md'}(記録 {rec['id']}、sha256 {rec['final_sha256'][:12]})", file=sys.stderr)
+    print(f"差分を読み、内容(数値・機能の有無・試験結果・約束)が変わっていないと確かめたら: "
+          f"agent-publish confirm {rec['id']} --reviewed-diff", file=sys.stderr)
+    return 0
+
+
+def cmd_polish(a) -> int:
+    R, cfg = root(), P.load_config(root())
+    if a.kind not in P.KINDS:
+        print(f"--kind は {', '.join(P.KINDS)}", file=sys.stderr)
+        return 2
+    if a.kind == "readme" and not (a.path and P.is_public_doc(a.path, cfg)):
+        print(f"--kind readme では --path に公開文書のパス(AGENT_PUBLIC_DOC_GLOBS: {cfg['AGENT_PUBLIC_DOC_GLOBS']})を"
+              "リポジトリの中の相対パスで書く", file=sys.stderr)
+        return 2
+    draft = Path(a.file).read_text(encoding="utf-8")
+    facts = Path(a.facts).read_text(encoding="utf-8") if a.facts else ""
+    if len(draft) > P.MAX_CHARS[a.kind] or len(facts) > P.MAX_FACTS:
+        print(f"大きすぎる(本文 {len(draft)} / 上限 {P.MAX_CHARS[a.kind]}、事実メモ {len(facts)} / 上限 {P.MAX_FACTS})。"
+              "対象の文章と必要最小限の事実だけを渡す", file=sys.stderr)
+        return 2
+    if a.kind == "pr-title" and "\n" in draft.strip():
+        print("PR のタイトルは1行", file=sys.stderr)
+        return 2
+    leaks = P.scan(draft + "\n" + facts, cfg)
+    rid = secrets.token_hex(8)
+    rec = {"id": rid, "kind": a.kind, "path": a.path or "", "created_at": P._now(), "status": "new",
+           "draft_sha256": P.sha256(draft), "facts_sha256": P.sha256(facts), "attempts": 0}
+    d = P.rec_dir(R, rid)
+    d.mkdir(parents=True)
+    (d / "draft.md").write_text(draft, encoding="utf-8")
+    (d / "facts.md").write_text(facts, encoding="utf-8")
+    rec["_dir"] = str(d)
+    if leaks:
+        # 外へ出す前の検査で止める(Gemini にも送らない)
+        rec.update(status="rejected", hold_reason="下書き・事実メモに秘密・非公開の情報らしいもの: " + ", ".join(leaks))
+        P.save(R, rec)
+        print(f"不採用: {rec['hold_reason']}。Gemini には送っていない(記録 {rid})", file=sys.stderr)
+        return EXIT_REJECT
+    if cfg["AGENT_POLISH_REQUIRED"] != "1":
+        print("注: AGENT_POLISH_REQUIRED=0(推敲しない設定)。下書きをそのまま記録だけする", file=sys.stderr)
+        return _check_and_store(R, cfg, rec, draft, "下書き(推敲なし)")
+    print(f"記録 {rid}", file=sys.stderr)
+    return _attempt(R, cfg, rec)
+
+
+def cmd_retry(a) -> int:
+    R, cfg = root(), P.load_config(root())
+    rec = P.load(R, a.id)
+    if rec["status"] not in ("held", "rejected"):
+        print(f"記録 {a.id} は {rec['status']}(保留・不採用のものだけ再試行する)", file=sys.stderr)
+        return 2
+    if rec.get("hold_reason", "").startswith("下書き・事実メモに秘密"):
+        print("下書き・事実メモの検査で止まったもの。下書きを直して polish からやり直す", file=sys.stderr)
+        return 2
+    if rec.get("attempts", 0) >= int(cfg["AGENT_GEMINI_MAX_ATTEMPTS"]):
+        print(f"再試行の上限({cfg['AGENT_GEMINI_MAX_ATTEMPTS']} 回)。下書きを見直す", file=sys.stderr)
+        return EXIT_HOLD
+    if P.scan(P.text_of(rec, "draft.md") + "\n" + P.text_of(rec, "facts.md"), cfg):
+        print("下書き・事実メモに秘密・非公開の情報らしいものがある。送らない", file=sys.stderr)
+        return EXIT_REJECT
+    return _attempt(R, cfg, rec)
+
+
+def cmd_revise(a) -> int:
+    R, cfg = root(), P.load_config(root())
+    rec = P.load(R, a.id)
+    if rec["status"] not in ("polished", "confirmed", "rejected") or rec.get("hold_reason", "").startswith("下書き・事実メモに秘密"):
+        print(f"記録 {a.id} は {rec['status']}(推敲稿のあるもの・推敲稿の検査で不採用になったものだけ直せる)", file=sys.stderr)
+        return 2
+    return _check_and_store(R, cfg, rec, Path(a.file).read_text(encoding="utf-8"), "作成側の修正")
+
+
+def cmd_confirm(a) -> int:
+    R = root()
+    rec = P.load(R, a.id)
+    if rec["status"] != "polished":
+        print(f"記録 {a.id} は {rec['status']}(推敲稿のあるものだけ確認できる)", file=sys.stderr)
+        return 2
+    if not a.reviewed_diff:
+        print("差分を読んだら --reviewed-diff を付ける(機械の検査は意味が同じことの保証ではない)", file=sys.stderr)
+        return 2
+    final = P.text_of(rec, "final.md")
+    if P.sha256(final) != rec.get("final_sha256"):
+        print("推敲稿のファイルが記録のあとで変わっている。agent-publish revise で検証し直す", file=sys.stderr)
+        return EXIT_REJECT
+    ev = evidence(sys.argv[1:])
+    rec["confirm"] = {"at": P._now(), "note": a.note or "", "hook_session_id": ev.get("hook_session_id", ""),
+                      "remote_session_id": ev.get("remote_session_id", ""), "evidence": bool(ev)}
+    rec["status"] = "confirmed"
+    P.save(R, rec)
+    print(f"確認済み: {a.id}(sha256 {rec['final_sha256'][:12]})")
+    return 0
+
+
+def cmd_show(a) -> int:
+    R = root()
+    rec = P.load(R, a.id)
+    print(json.dumps({k: v for k, v in rec.items() if not k.startswith("_")}, ensure_ascii=False, indent=2))
+    if (Path(rec["_dir"]) / "final.md").exists():
+        print(P.unified_diff(P.text_of(rec, "draft.md"), P.text_of(rec, "final.md")))
+    return 0
+
+
+def cmd_list(a) -> int:
+    R = root()
+    for d in sorted(P.state_root(R).glob("*/record.json")):
+        try:
+            r = json.loads(d.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        print(f"{r['id']}  {r['kind']:<13} {r['status']:<9} {r.get('path', '')} {r.get('hold_reason', '')[:80]}")
+    return 0
+
+
+def cmd_apply(a) -> int:
+    R = root()
+    rec = P.load(R, a.id)
+    try:
+        text = P.confirmed_text(R, a.id, "readme")
+    except ValueError as e:
+        print(f"書かない: {e}", file=sys.stderr)
+        return EXIT_HOLD
+    dst = (R / rec["path"]).resolve()
+    if R not in dst.parents or not P.is_public_doc(dst.relative_to(R).as_posix(), P.load_config(R)) or (R / rec["path"]).is_symlink():
+        print(f"書かない: {rec['path']} は公開文書のパスでない(リポジトリの外・設定のファイル・リンク)", file=sys.stderr)
+        return 2
+    dst.write_text(text, encoding="utf-8")
+    print(f"{rec['path']} を確認済みの本文で書いた。commit してから agent-publish push で公開する")
+    return 0
+
+
+# --- 公開 ---------------------------------------------------------------------------
+def _required(cfg) -> bool:
+    return cfg["AGENT_POLISH_REQUIRED"] == "1"
+
+
+def _get(R, cfg, rid, kind, fallback_file=None) -> str:
+    if rid:
+        return P.confirmed_text(R, rid, kind)
+    if _required(cfg):
+        raise ValueError(f"{P.KINDS[kind if isinstance(kind, str) else kind[0]]}の確認済みの記録(--…-id)が要る")
+    if fallback_file:
+        return Path(fallback_file).read_text(encoding="utf-8")
+    raise ValueError("本文が無い")
+
+
+def _publish_mark(**ids) -> str:
+    from agentgh import issues
+    return issues.mark("publish", {k: v for k, v in ids.items() if v})
+
+
+def cmd_pr_create(a) -> int:
+    R, cfg = root(), P.load_config(root())
+    try:
+        title = _get(R, cfg, a.title_id, "pr-title").strip()
+        body = _get(R, cfg, a.body_id, "pr-body")
+    except ValueError as e:
+        print(f"保留: {e}", file=sys.stderr)
+        return EXIT_HOLD
+    mark = _publish_mark(title_record=a.title_id, title_sha256=P.sha256(title) if a.title_id else "",
+                         body_record=a.body_id, body_sha256=P.sha256(body) if a.body_id else "")
+    import runpy
+    g = runpy.run_path(str(Path(__file__).resolve().parent / "agent-gh"), run_name="agent_gh_lib")
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+        f.write(body + "\n\n" + mark + "\n")
+        bf = f.name
+    ns = argparse.Namespace(issue=a.issue, branch=a.branch, title=title, agent=a.agent, session=a.session, body_file=bf,
+                            no_draft=a.no_draft, evidence=evidence(sys.argv[1:]))
+    try:
+        return g["cmd_pr_create"](ns, g["repo_slug"](a.repo))
+    except g["ApiError"] as e:
+        print(f"GitHub API エラー: {e}", file=sys.stderr)
+        return EXIT_GH
+    finally:
+        os.unlink(bf)
+
+
+def cmd_pr_edit(a) -> int:
+    R, cfg = root(), P.load_config(root())
+    if not (a.title_id or a.body_id):
+        print("--title-id か --body-id を指定する", file=sys.stderr)
+        return 2
+    from agentgh import issues
+    from agentgh.api import ApiError, api, repo_slug
+    repo = repo_slug(a.repo)
+    try:
+        payload = {}
+        if a.title_id:
+            payload["title"] = P.confirmed_text(R, a.title_id, "pr-title").strip()
+        if a.body_id:
+            body = P.confirmed_text(R, a.body_id, "pr-body")
+            old = api("GET", f"repos/{repo}/pulls/{a.number}").get("body") or ""
+            keep = [ln for ln in old.splitlines() if ln.startswith("<!-- agent-") and not ln.startswith("<!-- agent-publish:")]
+            keep += [ln for ln in old.splitlines() if ln.startswith(("Closes #", "Fixes #", "Resolves #"))]
+            mark = _publish_mark(body_record=a.body_id, body_sha256=P.sha256(body))
+            payload["body"] = body + "\n\n" + "\n".join(dict.fromkeys(keep + [mark])) + "\n"
+    except ValueError as e:
+        print(f"保留: {e}", file=sys.stderr)
+        return EXIT_HOLD
+    try:
+        api("PATCH", f"repos/{repo}/pulls/{a.number}", payload)
+    except ApiError as e:
+        print(f"GitHub API エラー: {e}", file=sys.stderr)
+        return EXIT_GH
+    print(f"PR #{a.number} を更新した({', '.join(payload)})")
+    return 0
+
+
+def cmd_release(a) -> int:
+    R, cfg = root(), P.load_config(root())
+    try:
+        notes = _get(R, cfg, a.notes_id, "release-notes")
+        title = P.confirmed_text(R, a.title_id, "pr-title").strip() if a.title_id else a.tag
+    except ValueError as e:
+        print(f"保留: {e}", file=sys.stderr)
+        return EXIT_HOLD
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+        f.write(notes + "\n\n" + _publish_mark(notes_record=a.notes_id, notes_sha256=P.sha256(notes)) + "\n")
+        nf = f.name
+    cmd = [os.environ.get("GH_BIN", "gh"), "release", "create", a.tag, "--notes-file", nf, "--title", title]
+    if not a.publish:
+        cmd.append("--draft")
+    if a.repo:
+        cmd += ["--repo", a.repo]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    finally:
+        os.unlink(nf)
+    if r.returncode != 0:
+        print(f"gh release create に失敗: {(r.stderr or r.stdout).strip()[:300]}", file=sys.stderr)
+        return EXIT_GH
+    print((r.stdout or "").strip() or f"リリース {a.tag}({'公開' if a.publish else '下書き'})を作った")
+    return 0
+
+
+def _check_push(R, cfg, remote, branch) -> tuple[list[str], str]:
+    args = [remote] + ([branch] if branch else [])
+    return P.unconfirmed_in_push(R, cfg, args), "push する ref"
+
+
+def cmd_check_push(a) -> int:
+    R, cfg = root(), P.load_config(root())
+    if not _required(cfg):
+        return 0
+    try:
+        bad, base = _check_push(R, cfg, a.remote, a.branch)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+        print(f"確かめられない: {e}", file=sys.stderr)
+        return EXIT_HOLD
+    if bad:
+        print(f"確認済みでない公開文書がある({', '.join(bad)}。基点 {base})。agent-publish polish --kind readme → confirm → "
+              "apply → commit してから push する", file=sys.stderr)
+        return EXIT_HOLD
+    return 0
+
+
+def cmd_push(a) -> int:
+    rc = cmd_check_push(a)
+    if rc:
+        return rc
+    cmd = ["git", "push", a.remote] + ([a.branch] if a.branch else [])
+    r = subprocess.run(cmd)
+    return 0 if r.returncode == 0 else EXIT_GH
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    def sub(name, fn):
+        p = sp.add_parser(name)
+        p.set_defaults(fn=fn)
+        return p
+    p = sub("polish", cmd_polish); p.add_argument("--kind", required=True); p.add_argument("--file", required=True)
+    p.add_argument("--facts"); p.add_argument("--path")
+    p = sub("retry", cmd_retry); p.add_argument("id")
+    p = sub("revise", cmd_revise); p.add_argument("id"); p.add_argument("--file", required=True)
+    p = sub("confirm", cmd_confirm); p.add_argument("id"); p.add_argument("--reviewed-diff", action="store_true")
+    p.add_argument("--note")
+    p = sub("show", cmd_show); p.add_argument("id")
+    sub("list", cmd_list)
+    p = sub("apply", cmd_apply); p.add_argument("id")
+    p = sub("pr-create", cmd_pr_create); p.add_argument("--issue", type=int, required=True)
+    p.add_argument("--branch", required=True); p.add_argument("--title-id"); p.add_argument("--body-id")
+    p.add_argument("--agent", default="unknown"); p.add_argument("--session"); p.add_argument("--no-draft", action="store_true")
+    p = sub("pr-edit", cmd_pr_edit); p.add_argument("number", type=int); p.add_argument("--title-id"); p.add_argument("--body-id")
+    p = sub("release", cmd_release); p.add_argument("tag"); p.add_argument("--notes-id"); p.add_argument("--title-id")
+    p.add_argument("--publish", action="store_true")
+    for name, fn in (("push", cmd_push), ("check-push", cmd_check_push)):
+        p = sub(name, fn); p.add_argument("remote", nargs="?", default="origin"); p.add_argument("branch", nargs="?")
+    return ap
+
+
+def main() -> int:
+    a = build_parser().parse_args()
+    try:
+        return a.fn(a)
+    except (ValueError, OSError, json.JSONDecodeError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

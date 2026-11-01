@@ -1,0 +1,50 @@
+name: エージェント向けタスク
+description: エージェント(dot / Claude / Codex)が実装できる粒度の課題。受入条件まで書く。
+title: "[task] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `agent:ready` を付けるとエージェントが着手できます(付けるのは内容を確認した人)。
+        GrokBot が作る Issue は `source:grokbot` を付け、`agent:ready` は付けません。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 問題
+      description: 何が困っているか・何が起きているか(再現手順があれば)
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待する動作
+      description: どうなっていれば解決か
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 受入条件/確認方法
+      description: チェックできる条件と、その確かめ方(テスト名・コマンド・画面の手順)
+      placeholder: |
+        - [ ] ...
+        - 確認方法: npm test -- auth
+    validations:
+      required: true
+  - type: textarea
+    id: depends
+    attributes:
+      label: 依存
+      description: 先に完了・マージが必要な Issue / PR(#123 や URL)。無ければ「なし」
+      value: なし
+  - type: textarea
+    id: context
+    attributes:
+      label: 背景(任意)
+      description: 関連する判断・過去の経緯(Vault のノート名や要約。秘密は書かない)
+  - type: textarea
+    id: scope
+    attributes:
+      label: 範囲外(任意)
+      description: このタスクでやらないこと
