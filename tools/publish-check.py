@@ -12,6 +12,7 @@
 - 中身を点検できないファイル(NUL を含む)は、--allow-binary に書いたもの以外を一覧に出す
 - 個人の文字列は大文字・小文字を区別せずに探す
 - --history: そのディレクトリが git リポジトリなら、履歴(全コミットの内容)も同じ規則で調べる
+  浅い clone では全履歴を読めないため、未検査として不合格にする
 
 見つかったら一覧を出して終了コード 1。何も無ければ 0。見つからないことは「安全の証明」ではない。
 """
@@ -106,6 +107,8 @@ def scan_history(root: Path, rules) -> list[str]:
 
     hits, seen = [], set()
     try:
+        if git("rev-parse", "--is-shallow-repository").strip() != b"false":
+            return ["history: shallow clone のため全履歴が未検査。公開前に全履歴を取得してください"]
         revs = git("rev-list", "--all").decode().split()
         for rev in revs:
             files = git("ls-tree", "-r", "--name-only", "-z", rev).decode().split("\0")

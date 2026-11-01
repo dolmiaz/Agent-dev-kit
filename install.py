@@ -17,6 +17,7 @@
 - 同名の skill ディレクトリが既にあり、キットが入れたもので無ければ、その skill は入れない。
 - 更新時、手で変更されたキットのファイルは上書きしない(報告する)。
 - 変更前のファイルはリポジトリの外(~/.local/state/agent-kit/<repo>-<hash>/install-backups/<日時>/)に保存する。
+- 書き込み・退避・削除の前に対象全体を検査し、symlink や管理範囲外の manifest は変更前に拒否する。
 """
 from __future__ import annotations
 
@@ -26,8 +27,9 @@ import hashlib
 import json
 import re
 import shutil
+import stat
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 HERE = Path(__file__).resolve().parent
 KIT = HERE / "kit" / ".agent-kit"
@@ -40,6 +42,115 @@ SKILL_DIRS = {"claude": ".claude/skills", "codex": ".agents/skills"}
 GH_TEMPLATES = {".github/ISSUE_TEMPLATE/agent-task.yml": "github/ISSUE_TEMPLATE/agent-task.yml",
                 ".github/pull_request_template.md": "github/pull_request_template.md"}
 SKIP = {"__pycache__", ".DS_Store"}
+BACKUP_TARGETS = (".agent-kit", ".claude/settings.json", "CLAUDE.md", "AGENTS.md", ".gitignore", ".github")
+
+
+class UnsafeInstallPath(ValueError):
+    """An unsafe target or manifest; diagnostics must not reveal its value."""
+
+
+def relative_path(rel: str) -> PurePosixPath:
+    if not isinstance(rel, str) or not rel or "\\" in rel or "\0" in rel:
+        raise UnsafeInstallPath("不正な相対パス")
+    p = PurePosixPath(rel)
+    if not p.parts or p.is_absolute() or p.as_posix() != rel or any(x in (".", "..", ".git") for x in p.parts) or re.match(r"^[A-Za-z]:", rel):
+        raise UnsafeInstallPath("管理範囲外のパス")
+    return p
+
+
+def checked_path(root: Path, rel: str, kind: str | None = None, tree: bool = False) -> Path:
+    """Check lexically before joining; never follow a target or ancestor symlink."""
+    parts = relative_path(rel).parts
+    p = root
+    for i, part in enumerate(parts):
+        p = p / part
+        try:
+            mode = p.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode) or not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+            raise UnsafeInstallPath("symlink または特殊ファイル")
+        if i < len(parts) - 1 and not stat.S_ISDIR(mode):
+            raise UnsafeInstallPath("祖先がディレクトリではない")
+        if i == len(parts) - 1 and ((kind == "file" and not stat.S_ISREG(mode)) or
+                                    (kind == "dir" and not stat.S_ISDIR(mode))):
+            raise UnsafeInstallPath("対象の種類が一致しない")
+    if not p.resolve().is_relative_to(root):
+        raise UnsafeInstallPath("管理範囲外の対象")
+    if tree and p.is_dir():
+        for child in p.rglob("*"):
+            checked_path(root, child.relative_to(root).as_posix())
+    return p
+
+
+def managed_file(rel: str) -> bool:
+    relative_path(rel)
+    return (rel.startswith(".agent-kit/") and rel != MANIFEST.as_posix()) or rel in GH_TEMPLATES or any(
+        rel.startswith(f"{d}/{s}/") for d in SKILL_DIRS.values() for s in KIT_SKILLS)
+
+
+def managed_dir(rel: str) -> bool:
+    relative_path(rel)
+    return rel in {".agent-kit", ".claude", ".claude/skills", ".agents", ".agents/skills", ".github", ".github/ISSUE_TEMPLATE"} or \
+        rel.startswith(".agent-kit/") or any(rel == f"{d}/{s}" or rel.startswith(f"{d}/{s}/")
+                                           for d in SKILL_DIRS.values() for s in KIT_SKILLS)
+
+
+def validate_manifest(repo: Path, man: dict) -> None:
+    if not isinstance(man, dict) or not isinstance(man.get("files", {}), dict):
+        raise UnsafeInstallPath("manifest の形式が不正")
+    for rel, digest in man.get("files", {}).items():
+        if not managed_file(rel) or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise UnsafeInstallPath("manifest の管理ファイルが不正")
+        checked_path(repo, rel, "file")
+    blocks, dirs, settings = man.get("blocks", []), man.get("created_dirs", []), man.get("settings", {})
+    if not isinstance(blocks, list) or not isinstance(dirs, list) or not isinstance(settings, dict):
+        raise UnsafeInstallPath("manifest の管理対象が不正")
+    for b in blocks:
+        if not isinstance(b, dict) or b.get("file") not in ("AGENTS.md", "CLAUDE.md") or not isinstance(b.get("created", False), bool):
+            raise UnsafeInstallPath("manifest の文書パスが不正")
+        checked_path(repo, b["file"], "file")
+    for rel in dirs:
+        if not managed_dir(rel):
+            raise UnsafeInstallPath("manifest のディレクトリが管理範囲外")
+        checked_path(repo, rel, "dir")
+    if not isinstance(settings.get("created", False), bool) or not isinstance(settings.get("added", []), list):
+        raise UnsafeInstallPath("manifest の設定情報が不正")
+    for group in settings.get("added", []):
+        if not isinstance(group, dict) or not isinstance(group.get("event"), str) or \
+                not isinstance(group.get("commands"), list) or not all(isinstance(c, str) for c in group["commands"]):
+            raise UnsafeInstallPath("manifest のフック情報が不正")
+
+
+def preflight(pl: Plan, man: dict | None, targets: list[str], gh_templates: bool) -> None:
+    """Inspect every possible target and backup before the first mutation."""
+    if man is not None:
+        validate_manifest(pl.repo, man)
+    checked_path(pl.repo, MANIFEST.as_posix(), "file")
+    for rel in BACKUP_TARGETS:
+        checked_path(pl.repo, rel, tree=True)
+    for rel, src in kit_files():
+        if src.is_symlink():
+            raise UnsafeInstallPath("キットのソースが symlink")
+        checked_path(pl.repo, rel, "file")
+    for t in targets:
+        for skill in KIT_SKILLS:
+            d = f"{SKILL_DIRS[t]}/{skill}"
+            checked_path(pl.repo, d, "dir", tree=True)
+            for src in (KIT / "skills" / skill).rglob("*"):
+                if src.is_symlink():
+                    raise UnsafeInstallPath("スキルのソースが symlink")
+                if src.is_file():
+                    checked_path(pl.repo, f"{d}/{src.relative_to(KIT / 'skills' / skill).as_posix()}", "file")
+    for name, t in (("CLAUDE.md", "claude"), ("AGENTS.md", "codex")):
+        if t in targets:
+            checked_path(pl.repo, name, "file")
+    checked_path(pl.repo, ".claude/settings.json", "file")
+    checked_path(pl.repo, ".gitignore", "file")
+    if gh_templates:
+        for rel in GH_TEMPLATES:
+            checked_path(pl.repo, rel, "file")
+    pl.check_backup_dir()
 
 
 def sha(p: Path) -> str:
@@ -63,19 +174,29 @@ class Plan:
         self.backup_dir = backup_root(repo) / self.stamp
         self.created_dirs: set[str] = set()
 
+    def check_backup_dir(self) -> None:
+        if not self.backup_dir.is_absolute():
+            raise UnsafeInstallPath("退避先は絶対パスが必要")
+        anchor = Path(self.backup_dir.anchor)
+        checked_path(anchor, self.backup_dir.relative_to(anchor).as_posix(), "dir", tree=True)
+        if self.backup_dir.resolve().is_relative_to(self.repo):
+            raise UnsafeInstallPath("退避先はリポジトリの外が必要")
+
     def backup(self, rel: str) -> None:
-        src = self.repo / rel
+        src = checked_path(self.repo, rel, tree=True)
+        self.check_backup_dir()
         if self.dry or not src.exists():
             return
         dst = self.backup_dir / rel
+        checked_path(Path(dst.anchor), dst.relative_to(dst.anchor).as_posix(), tree=True)
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src.is_dir():
-            shutil.copytree(src, dst, dirs_exist_ok=True)
+            shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True)
         else:
-            shutil.copy2(src, dst)
+            shutil.copy2(src, dst, follow_symlinks=False)
 
     def write_bytes(self, rel: str, data: bytes, mode: int | None = None) -> None:
-        p = self.repo / rel
+        p = checked_path(self.repo, rel, "file")
         if p.exists() and p.read_bytes() == data:
             return
         self.log.append(("update" if p.exists() else "create", rel))
@@ -90,12 +211,10 @@ class Plan:
                 p.chmod(mode)
 
     def remove(self, rel: str) -> None:
+        p = checked_path(self.repo, rel, "file")
         self.log.append(("delete", rel))
         if not self.dry:
-            p = self.repo / rel
-            if p.is_dir():
-                shutil.rmtree(p)
-            elif p.exists():
+            if p.exists():
                 p.unlink()
 
     def note(self, what: str, rel: str) -> None:
@@ -103,7 +222,7 @@ class Plan:
 
 
 def load_manifest(repo: Path) -> dict | None:
-    p = repo / MANIFEST
+    p = checked_path(repo, MANIFEST.as_posix(), "file")
     if p.exists():
         return json.loads(p.read_text(encoding="utf-8"))
     return None
@@ -167,17 +286,19 @@ def install(repo: Path, only: str | None, gh_templates: bool, dry: bool) -> list
     man = load_manifest(repo)
     if (repo / ".agent-kit").exists() and man is None:
         sys.exit("中止: .agent-kit が既にあるが、このキットの manifest が無い(別物の可能性)。手で確認してください")
+    targets = [t for t in ("claude", "codex") if only in (None, t)]
+    preflight(pl, man, targets, gh_templates)
     prev_files = (man or {}).get("files", {})
     new = {"kit_version": VERSION, "installed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-           "targets": [t for t in ("claude", "codex") if only in (None, t)], "files": {}, "kept_modified": [],
+           "targets": targets, "files": {}, "kept_modified": [],
            "settings": (man or {}).get("settings", {"created": False, "added": []}),
            "blocks": (man or {}).get("blocks", []), "gitignore_added": (man or {}).get("gitignore_added", False),
            "gitignore_created": (man or {}).get("gitignore_created", False)}
-    for rel in (".agent-kit", ".claude/settings.json", "CLAUDE.md", "AGENTS.md", ".gitignore", ".github"):
+    for rel in BACKUP_TARGETS:
         pl.backup(rel)
 
     def place(rel: str, src: Path, keep_existing: bool = False) -> None:
-        p = repo / rel
+        p = checked_path(repo, rel, "file")
         if p.exists():
             cur = sha(p)
             if keep_existing:
@@ -256,8 +377,7 @@ def install(repo: Path, only: str | None, gh_templates: bool, dry: bool) -> list
     changed = pl.log or man is None or {k: v for k, v in new.items() if k != "installed_at"} != \
         {k: v for k, v in (man or {}).items() if k != "installed_at"}
     if not dry and changed:
-        (repo / MANIFEST).parent.mkdir(parents=True, exist_ok=True)
-        (repo / MANIFEST).write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        pl.write_bytes(MANIFEST.as_posix(), (json.dumps(new, ensure_ascii=False, indent=2) + "\n").encode())
     return pl.log
 
 
@@ -266,7 +386,8 @@ def uninstall(repo: Path, dry: bool) -> list:
     man = load_manifest(repo)
     if man is None:
         sys.exit("manifest が無い(このキットで入れていない)。何もしない")
-    for rel in (".agent-kit", ".claude/settings.json", "CLAUDE.md", "AGENTS.md", ".gitignore", ".github"):
+    preflight(pl, man, ["claude", "codex"], True)
+    for rel in BACKUP_TARGETS:
         pl.backup(rel)
     for rel, h in man.get("files", {}).items():
         p = repo / rel
@@ -304,7 +425,7 @@ def uninstall(repo: Path, dry: bool) -> list:
     pl.remove(str(MANIFEST))
     if not dry:   # キットが作ったディレクトリのうち、空になったものだけ消す(もとからあったディレクトリは残す)
         for d in sorted(man.get("created_dirs", []), key=lambda x: -x.count("/")):
-            p = repo / d
+            p = checked_path(repo, d, "dir")
             if p.is_dir() and not any(p.iterdir()):
                 p.rmdir()
     return pl.log
@@ -356,9 +477,14 @@ def main() -> int:
     if not (repo / ".git").exists():
         print(f"git リポジトリではない: {repo}", file=sys.stderr)
         return 2
-    log = uninstall(repo, a.dry_run) if a.uninstall else install(repo, a.only, a.github_templates, a.dry_run)
-    if a.profile and not a.uninstall:
-        log += apply_profile(repo / ".agent-kit" / "config.env", Path(a.profile), a.dry_run)
+    try:
+        log = uninstall(repo, a.dry_run) if a.uninstall else install(repo, a.only, a.github_templates, a.dry_run)
+        if a.profile and not a.uninstall:
+            cfg = checked_path(repo, ".agent-kit/config.env", "file")
+            log += apply_profile(cfg, Path(a.profile), a.dry_run)
+    except (UnsafeInstallPath, json.JSONDecodeError):
+        print("中止: 安全な導入先・退避先・manifest を確認できません。変更先を手で確認してください(値は非表示)", file=sys.stderr)
+        return 2
     for act, p in log:
         print(f"{'[dry-run] ' if a.dry_run else ''}{act}: {p}")
     if not log:
