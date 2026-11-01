@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""agent-log — クラウドのコーディングエージェント(Codex Cloud / Claude Code on the web)の作業ログを
+ターンごとに1つの Markdown として残し、書き込み専用の受け口(Apps Script)経由で Google Drive へ届ける。
+
+不変条件
+- 1ターン1ファイル。作成後は内容を変えない(秘密の除去で変わる場合だけ書き直して警告)。
+- 各ログは UUID4 の log_id を持つ。再送しても同じ log_id・同じ内容(sha256)を送る。
+- 成功とみなすのは、受け口が同じ log_id と sha256 を返したときだけ(同名だけでは成功にしない)。
+- 実行中のサービスと違うサービスのログは送らない(別サービスのフォルダへの誤送信を防ぐ)。
+- 未送信ログの既定の置き場は、リポジトリの外(状態ディレクトリの outbox)。Git に入れない。
+  AGENT_LOG_PENDING_MODE=repo を明示したときだけ .agent-logs/pending/ に置く。
+- 送れなくても作業を止めない(既定)。AGENT_LOG_STRICT=1 で終了コード1。
+
+設定の優先順位: 環境変数 > .agent-kit/config.env > 既定値。標準ライブラリのみ(Python 3.8+)。
+
+使い方
+  agent-log turn --title T --purpose P --done D --tests X [--failures F] [--todo T] [--pr URL] [--json FILE|-] [--no-sync]
+  agent-log sync            送信待ちを送る
+  agent-log status          置き場・件数・設定の有無
+  agent-log show [latest|ファイル名]   ログ本文を表示(未送信時に最終返答へ貼るため)
+  agent-log redact < in     秘密の除去だけ試す
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as _dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
+
+JST = _dt.timezone(_dt.timedelta(hours=9))
+MAX_FIELD = 4000
+MAX_DOC = 120_000
+SERVICE_LONG = {"claude": "claude-code-web", "codex": "codex-cloud"}
+
+# ---------------------------------------------------------------------------
+# 設定
+# ---------------------------------------------------------------------------
+def git(*args: str, cwd: Path | None = None) -> str:
+    try:
+        out = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=20)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def repo_root() -> Path:
+    r = os.environ.get("AGENT_REPO_ROOT")
+    if not r and os.environ.get("CLAUDE_PROJECT_DIR") and Path(os.environ["CLAUDE_PROJECT_DIR"], ".agent-kit").is_dir():
+        r = os.environ["CLAUDE_PROJECT_DIR"]
+    r = r or git("rev-parse", "--show-toplevel")
+    return Path(r) if r else Path.cwd()
+
+
+def parse_config(path) -> dict:
+    """config.env を読む(シェルの load_config と同じ規則: 空白・CRLF・行末コメント・引用符)"""
+    out = {}
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.rstrip("\r")
+        if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if not re.fullmatch(r"AGENT_[A-Z0-9_]+", k):
+            continue
+        if v[:1] in ("'", '"') and v[0] in v[1:]:
+            v = v[1:v.index(v[0], 1)]
+        else:
+            v = re.split(r"\s+#", v, maxsplit=1)[0].strip()
+        out[k] = v
+    return out
+
+
+_CFG: dict | None = None
+
+
+def cfg(key: str, default: str = "") -> str:
+    """環境変数 > config.env > default"""
+    global _CFG
+    if key in os.environ:
+        return os.environ[key]
+    if _CFG is None:
+        _CFG = parse_config(repo_root() / ".agent-kit" / "config.env")
+    return _CFG.get(key, default)
+
+
+def runtime() -> str:
+    if os.environ.get("AGENT_RUNTIME"):
+        return os.environ["AGENT_RUNTIME"]
+    if os.environ.get("CLAUDE_CODE_REMOTE") == "true":
+        return "claude-cloud"
+    return "ci" if os.environ.get("CI") else "local"
+
+
+def service() -> str:
+    if os.environ.get("AGENT_SERVICE"):
+        return os.environ["AGENT_SERVICE"]
+    return {"claude-cloud": "claude", "codex-cloud": "codex"}.get(runtime(), "unknown")
+
+
+def checkout_key(root: Path) -> str:
+    real = os.path.realpath(root)
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(real))[:40]
+    return f"{name}-{hashlib.sha256(real.encode()).hexdigest()[:12]}"
+
+
+def state_dir(root: Path) -> Path:
+    base = os.environ.get("AGENT_STATE_DIR") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(Path.home(), ".local", "state"), "agent-kit")
+    d = Path(base) / checkout_key(root)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+@contextlib.contextmanager
+def locked(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as fh:
+        if fcntl:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------------------
+# 秘密の除去
+# ---------------------------------------------------------------------------
+_PATTERNS = [
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.S), "[REDACTED:private-key]"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"), "[REDACTED:github-token]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "[REDACTED:github-token]"),
+    (re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b"), "[REDACTED:gitlab-token]"),
+    (re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"), "[REDACTED:anthropic-key]"),
+    (re.compile(r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{20,}\b"), "[REDACTED:openai-key]"),
+    (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "[REDACTED:aws-key-id]"),
+    (re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*\S+"), "aws_secret_access_key=[REDACTED]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), "[REDACTED:google-api-key]"),
+    (re.compile(r"\bya29\.[0-9A-Za-z_\-]{20,}"), "[REDACTED:google-oauth]"),
+    (re.compile(r"\b1//0[0-9A-Za-z_\-]{30,}"), "[REDACTED:google-refresh]"),
+    (re.compile(r"\bxox[abposr]-[A-Za-z0-9\-]{10,}\b"), "[REDACTED:slack-token]"),
+    (re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"), "[REDACTED:stripe-key]"),
+    (re.compile(r"\bnpm_[A-Za-z0-9]{30,}\b"), "[REDACTED:npm-token]"),
+    (re.compile(r"\bpypi-[A-Za-z0-9_\-]{30,}\b"), "[REDACTED:pypi-token]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"), "[REDACTED:jwt]"),
+    (re.compile(r"(?i)(authorization\s*[:=]\s*)(bearer|basic|token)\s+[A-Za-z0-9._~+/=\-]{8,}"), r"\1\2 [REDACTED]"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{16,}"), "Bearer [REDACTED]"),
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1[REDACTED]@"),
+    (re.compile(r"(?i)\b((?:api[_-]?key|secret|token|password|passwd|client[_-]?secret|access[_-]?key)"
+                r"[A-Za-z0-9_\-]*)\s*([:=])\s*(['\"]?)[^\s'\"]{6,}\3"), r"\1\2[REDACTED]"),
+    (re.compile(r"https://script\.google\.com/macros/s/[A-Za-z0-9_\-]+"), "[REDACTED:log-endpoint]"),
+]
+_SECRET_PARTS = {"TOKEN", "SECRET", "SECRETS", "PASSWORD", "PASSWD", "PRIVATE", "CREDENTIAL", "CREDENTIALS",
+                 "APIKEY", "COOKIE", "WEBHOOK", "AUTH", "KEY", "PAT", "DSN"}
+_ALWAYS_SECRET_ENV = ("AGENT_LOG_KEY", "AGENT_LOG_ENDPOINT")
+_NOT_SECRET_ENV = ("CLAUDE_CODE_REMOTE_SESSION_ID",)
+MIN_SECRET_LEN = 12
+
+
+def _is_secret_name(k: str) -> bool:
+    """名前の区切り(_)単位で判定する。GIT_AUTHOR_NAME や MAX_THINKING_TOKENS は秘密としない"""
+    if k in _ALWAYS_SECRET_ENV:
+        return True
+    if k in _NOT_SECRET_ENV:
+        return False
+    return bool(set(k.upper().split("_")) & _SECRET_PARTS)
+
+
+def redact(text: str) -> str:
+    if not text:
+        return text
+    vals = sorted(((k, v) for k, v in os.environ.items()
+                   if v and (len(v) >= MIN_SECRET_LEN or k in _ALWAYS_SECRET_ENV) and _is_secret_name(k)),
+                  key=lambda kv: len(kv[1]), reverse=True)
+    for k, v in vals:
+        if v in text:
+            text = text.replace(v, f"[REDACTED:env:{k}]")
+    for pat, rep in _PATTERNS:
+        text = pat.sub(rep, text)
+    return text
+
+
+def redact_doc(doc: str) -> str:
+    """frontmatter(識別子)は変えず、本文だけ除去する"""
+    m = re.match(r"^---\n.*?\n---\n", doc, re.S)
+    if not m:
+        return redact(doc)
+    return doc[:m.end()] + redact(doc[m.end():])
+
+
+# ---------------------------------------------------------------------------
+# リポジトリの事実
+# ---------------------------------------------------------------------------
+def repo_slug(root: Path) -> str:
+    url = git("remote", "get-url", "origin", cwd=root)
+    m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$", url)
+    return m.group(1) if m else root.name
+
+
+def base_ref(root: Path) -> str:
+    for cand in (cfg("AGENT_BASE_BRANCH"), "origin/HEAD", "origin/main", "origin/master", "main", "master"):
+        if cand and git("rev-parse", "--verify", "--quiet", cand, cwd=root):
+            mb = git("merge-base", "HEAD", cand, cwd=root)
+            if mb:
+                return mb
+    return ""
+
+
+def git_facts(root: Path) -> dict:
+    facts = {"branch": git("rev-parse", "--abbrev-ref", "HEAD", cwd=root),
+             "head": git("rev-parse", "--short=12", "HEAD", cwd=root), "commits": [], "changed": [], "uncommitted": []}
+    base = base_ref(root)
+    if base:
+        facts["commits"] = [l for l in git("log", "--format=%h %s", f"{base}..HEAD", cwd=root).splitlines() if l][:50]
+        facts["changed"] = [l for l in git("diff", "--name-status", base, "HEAD", cwd=root).splitlines() if l][:200]
+    st = git("status", "--porcelain=v1", "--untracked-files=normal", cwd=root)
+    facts["uncommitted"] = [l for l in st.splitlines() if l and ".agent-logs/" not in l][:200]
+    return facts
+
+
+def session_info(sd: Path) -> tuple[str, str]:
+    """(session12, session_url)"""
+    sid = os.environ.get("CLAUDE_CODE_REMOTE_SESSION_ID", "")
+    if sid.startswith("cse_"):
+        raw = sid[len("cse_"):]
+        return re.sub(r"[^A-Za-z0-9]", "", raw)[:12], "https://claude.ai/code/session_" + raw
+    explicit = os.environ.get("AGENT_SESSION_ID", "")
+    if explicit:
+        return re.sub(r"[^A-Za-z0-9]", "", explicit)[:12], os.environ.get("AGENT_SESSION_URL", "")
+    p = sd / "session-id"
+    if not p.exists():
+        p.write_text(uuid.uuid4().hex, encoding="utf-8")
+    return p.read_text(encoding="utf-8").strip()[:12], os.environ.get("AGENT_SESSION_URL", "")
+
+
+# ---------------------------------------------------------------------------
+# 置き場
+# ---------------------------------------------------------------------------
+def pending_mode() -> str:
+    m = cfg("AGENT_LOG_PENDING_MODE", "outbox")
+    return m if m in ("outbox", "repo") else "outbox"
+
+
+def store(root: Path) -> tuple[Path, Path]:
+    """(pending, sent)"""
+    if pending_mode() == "repo":
+        d = root / ".agent-logs"
+        gi = d / ".gitignore"
+        d.mkdir(parents=True, exist_ok=True)
+        if not gi.exists():
+            gi.write_text("sent/\n*.tmp\npending/.attempted.json\n", encoding="utf-8")
+    else:
+        d = state_dir(root) / "outbox"
+    (d / "pending").mkdir(parents=True, exist_ok=True)
+    (d / "sent").mkdir(parents=True, exist_ok=True)
+    return d / "pending", d / "sent"
+
+
+FM_RE = re.compile(r"^---\n(.*?)\n---\n", re.S)
+
+
+def frontmatter(text: str) -> dict:
+    m = FM_RE.match(text)
+    out = {}
+    if m:
+        for line in m.group(1).splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                v = v.strip()
+                if v.startswith('"') and v.endswith('"'):
+                    try:
+                        v = json.loads(v)
+                    except Exception:
+                        v = v.strip('"')
+                out[k.strip()] = v
+    return out
+
+
+def _q(v) -> str:
+    if isinstance(v, int):
+        return str(v)
+    return json.dumps(str(v), ensure_ascii=False)
+
+
+def _clip(s: str | None) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= MAX_FIELD else s[:MAX_FIELD] + "\n…(長いため省略。詳細はPR・コミットを参照)"
+
+
+def _bullets(lines: list[str], empty: str = "なし") -> str:
+    lines = [l for l in lines if l.strip()]
+    return "\n".join(f"- `{l}`" for l in lines) if lines else f"- {empty}"
+
+
+def cmd_turn(a: argparse.Namespace) -> int:
+    data = {}
+    if a.json:
+        raw = sys.stdin.read() if a.json == "-" else Path(a.json).read_text(encoding="utf-8")
+        data = json.loads(raw)
+
+    def get(name: str) -> str:
+        v = getattr(a, name, None) or data.get(name)
+        if isinstance(v, list):
+            return "\n".join(f"- {x}" for x in v)
+        return v or ""
+
+    svc = service()
+    if svc not in SERVICE_LONG:
+        print("agent-log: サービスを判定できない(AGENT_SERVICE=claude|codex を設定)。記録しない", file=sys.stderr)
+        return 1 if strict() else 0
+    root = repo_root()
+    sd = state_dir(root)
+    pending, sent = store(root)
+    with locked(sd / "agent-log.lock"):
+        st = {}
+        sp = sd / "log-state.json"
+        if sp.exists():
+            try:
+                st = json.loads(sp.read_text(encoding="utf-8"))
+            except Exception:
+                st = {}
+        now = _dt.datetime.now(JST)
+        sess, surl = session_info(sd)
+        th = st.setdefault("threads", {}).setdefault(f"{svc}-{sess}", {
+            "thread": f"{now:%Y-%m-%d}-{svc}-{sess}", "turn": 0})
+        existing = 0
+        for d in (pending, sent):
+            for f in d.glob(f"*-{svc}-{sess}-t*.md"):
+                m = re.search(r"-t(\d+)-[0-9a-f]{8}\.md$", f.name)
+                if m:
+                    existing = max(existing, int(m.group(1)))
+        turn = max(existing, int(th["turn"])) + 1
+        th["turn"] = turn
+        log_id = str(uuid.uuid4())
+        facts = git_facts(root)
+        pr = get("pr") or os.environ.get("AGENT_PR_URL", "")
+        title = get("title") or "作業"
+        setup = "セットアップ: 記録なし"
+        try:
+            js = json.loads((sd / "last-setup.json").read_text(encoding="utf-8"))
+            bad = [s["name"] for s in js.get("steps", []) if s.get("status") != "ok"]
+            setup = "セットアップ: 問題なし" if not bad else "セットアップで失敗・時間切れ: " + ", ".join(bad)
+        except Exception:
+            pass
+        fm = {"source": svc, "kind": "agent-worklog", "service": SERVICE_LONG[svc], "runtime": runtime(),
+              "thread": th["thread"], "session": sess, "turn": turn, "log_id": log_id,
+              "date": f"{now:%Y-%m-%d %H:%M}", "repo": repo_slug(root), "branch": facts["branch"],
+              "head": facts["head"], "pr": pr, "session_url": surl}
+        links = ([f"- PR: {pr}"] if pr else []) + ([f"- セッション: {surl}"] if surl else [])
+        links += [f"- commit `{c}`" for c in facts["commits"]] or ["- コミット: なし(未コミット)"]
+        body = [f"## {now:%Y-%m-%d %H:%M} {title}", f"<!-- log: {log_id} -->", "",
+                "### 目的", _clip(get("purpose")) or "(未記入)", "",
+                "### 実施内容", _clip(get("done")) or "(未記入)", "",
+                "### 変更ファイル(基点ブランチとの差分)", _bullets(facts["changed"]), "",
+                "### 未コミットの変更", _bullets(facts["uncommitted"]), "",
+                "### テスト結果", _clip(get("tests")) or "(未実行・未記入)", "",
+                "### 失敗・問題", _clip(get("failures")) or "なし", "",
+                "### 未完了・次にやること", _clip(get("todo")) or "なし", "",
+                "### コミット・PR", *links, "",
+                "### 環境", f"- {fm['service']} / {fm['runtime']} / branch `{facts['branch']}` @ `{facts['head']}`",
+                f"- {setup}", ""]
+        for k in ("branch", "repo", "pr"):
+            fm[k] = redact(str(fm[k]))
+        doc = "\n".join(["---"] + [f"{k}: {_q(v)}" for k, v in fm.items()] + ["---", ""]) + redact("\n".join(body))
+        if len(doc) > MAX_DOC:
+            doc = doc[:MAX_DOC] + "\n\n…(上限を超えたため省略)\n"
+        name = f"{now:%Y-%m-%d-%H%M}-{svc}-{sess}-t{turn:02d}-{log_id[:8]}.md"
+        out = pending / name
+        tmp = out.with_name(out.name + ".tmp")
+        tmp.write_text(doc, encoding="utf-8")
+        os.replace(tmp, out)
+        tmpst = sp.with_name(sp.name + ".tmp")
+        tmpst.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmpst, sp)
+    where = out.relative_to(root) if pending_mode() == "repo" else out
+    print(f"agent-log: wrote {where} (log_id {log_id})")
+    if a.no_sync:
+        return 0
+    return cmd_sync(argparse.Namespace(quiet=False))
+
+
+# ---------------------------------------------------------------------------
+# 送信
+# ---------------------------------------------------------------------------
+def strict() -> bool:
+    return cfg("AGENT_LOG_STRICT", "0") == "1"
+
+
+def _ssl_context() -> ssl.SSLContext:
+    for k in ("AGENT_LOG_CA_FILE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"):
+        p = os.environ.get(k)
+        if p and Path(p).is_file():
+            ctx = ssl.create_default_context()
+            with contextlib.suppress(Exception):
+                ctx.load_verify_locations(cafile=p)
+            return ctx
+    return ssl.create_default_context()
+
+
+def _post(endpoint: str, payload: dict, timeout: float) -> dict:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(endpoint, data=data, method="POST",
+                                 headers={"Content-Type": "text/plain; charset=utf-8"})
+    # Apps Script は 302 で結果を返す。urllib は POST の 302 を GET に変えて追う(本文は送り直さない)。
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as r:
+        body = r.read(65536).decode("utf-8", "replace")
+    try:
+        return json.loads(body)
+    except Exception:
+        return {"ok": False, "status": "bad-response"}
+
+
+def _ledger(sent: Path) -> dict:
+    led = {}
+    p = sent / "ledger.jsonl"
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            with contextlib.suppress(Exception):
+                j = json.loads(line)
+                led[j["log_id"]] = j
+    return led
+
+
+def cmd_sync(a: argparse.Namespace) -> int:
+    root = repo_root()
+    pending, sent = store(root)
+    sd = state_dir(root)
+    with locked(sd / "sync.lock"):
+        return _sync_locked(root, pending, sent, quiet=getattr(a, "quiet", False))
+
+
+def _sync_locked(root: Path, pending: Path, sent: Path, quiet: bool) -> int:
+    files = sorted(pending.glob("*.md"))
+    svc = service()
+    mine, others = [], []
+    for f in files:
+        fm = frontmatter(f.read_text(encoding="utf-8"))
+        (mine if fm.get("source") == svc and svc in SERVICE_LONG else others).append(f)
+    if not files:
+        if not quiet:
+            print("agent-log: 送信待ちなし")
+        return 0
+    endpoint = os.environ.get("AGENT_LOG_ENDPOINT", "")
+    key = os.environ.get("AGENT_LOG_KEY", "")
+    note_other = f" / 別サービスのログ {len(others)}件(このサービスからは送らない)" if others else ""
+    if not mine:
+        print(f"agent-log: このサービスの送信待ちなし{note_other}")
+        return 0
+    if not endpoint or not key:
+        print(f"agent-log: UNSYNCED {len(mine)}件 — 送信先が未設定(AGENT_LOG_ENDPOINT / AGENT_LOG_KEY)。"
+              f" 置き場: {pending}{note_other}")
+        return 1 if strict() else 0
+    timeout = float(cfg("AGENT_LOG_SYNC_TIMEOUT", "20") or 20)
+    ledger = _ledger(sent)
+    ok = 0
+    attempted_p = pending / ".attempted.json"
+    try:
+        attempted = set(json.loads(attempted_p.read_text(encoding="utf-8")))
+    except Exception:
+        attempted = set()
+    for f in mine:
+        text = f.read_text(encoding="utf-8")
+        log_id0 = frontmatter(text).get("log_id", "")
+        clean = redact_doc(text)
+        if clean != text:
+            if log_id0 in attempted:
+                # 一度送ろうとした内容は変えない(同じ ID で内容が変わると conflict になる)。人が確認するまで送らない
+                print(f"agent-log: 保留 {f.name}: 秘密らしい文字列が残っている可能性。中身を確認してから手で対処する")
+                continue
+            print(f"agent-log: 警告 {f.name} に秘密らしい文字列があったため、送る前に除去して書き直した")
+            tmp = f.with_name(f.name + ".tmp")
+            tmp.write_text(clean, encoding="utf-8")
+            os.replace(tmp, f)
+            text = clean
+        fm = frontmatter(text)
+        log_id = fm.get("log_id", "")
+        sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", log_id or ""):
+            print(f"agent-log: 送らない {f.name}: log_id が UUID でない(旧形式?)")
+            continue
+        prev = ledger.get(log_id)
+        if prev and prev.get("sha256") == sha:
+            shutil.move(str(f), str(sent / f.name))
+            ok += 1
+            continue
+        attempted.add(log_id)
+        tmpa = attempted_p.with_name(attempted_p.name + ".tmp")
+        tmpa.write_text(json.dumps(sorted(attempted)), encoding="utf-8")
+        os.replace(tmpa, attempted_p)
+        try:
+            res = _post(endpoint, {"v": 2, "service": svc, "key": key, "filename": f.name,
+                                   "log_id": log_id, "sha256": sha, "content": text}, timeout)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            print(f"agent-log: 送信失敗 {f.name}: {redact(str(getattr(e, 'reason', e)))[:160]}")
+            continue
+        status = res.get("status", "")
+        if res.get("ok") and status in ("created", "duplicate") and res.get("log_id") == log_id and res.get("sha256") == sha:
+            shutil.move(str(f), str(sent / f.name))
+            with (sent / "ledger.jsonl").open("a", encoding="utf-8") as lf:
+                lf.write(json.dumps({"log_id": log_id, "file": f.name, "sha256": sha, "status": status,
+                                     "at": _dt.datetime.now(JST).isoformat(timespec="seconds")}) + "\n")
+            ok += 1
+        elif res.get("ok"):
+            print(f"agent-log: 送信を確認できない {f.name}: 受け口の応答が log_id / sha256 と一致しない")
+        else:
+            print(f"agent-log: 送信保留 {f.name}: {status}"
+                  + {"quota": "(受け口の利用上限。時間をおいて再送)", "storage-full": "(Drive の容量不足)",
+                     "rate-limited": "(1時間の件数上限)", "conflict": "(同じIDか同名で内容が違うファイルがある。上書きしない)",
+                     "unauthorized": "(鍵が違う)"}.get(status, ""))
+    left = len([f for f in pending.glob("*.md") if f in mine])
+    msg = f"agent-log: 送信 {ok}件"
+    if left:
+        msg += f" / UNSYNCED {left}件(置き場: {pending})"
+    print(msg + note_other)
+    return 1 if (strict() and left) else 0
+
+
+def cmd_status(_a) -> int:
+    root = repo_root()
+    pending, sent = store(root)
+    svc = service()
+    print(f"runtime: {runtime()}  service: {svc}  mode: {pending_mode()}")
+    print(f"endpoint: {'設定あり' if os.environ.get('AGENT_LOG_ENDPOINT') else '未設定'}  "
+          f"key: {'設定あり' if os.environ.get('AGENT_LOG_KEY') else '未設定'}")
+    print(f"pending: {pending}")
+    for f in sorted(pending.glob("*.md")):
+        src = frontmatter(f.read_text(encoding="utf-8")).get("source", "?")
+        print(f"  UNSYNCED {f.name}" + ("" if src == svc else f"  (別サービス: {src})"))
+    print(f"sent: {len(list(sent.glob('*.md')))}件")
+    return 0
+
+
+def cmd_show(a) -> int:
+    pending, sent = store(repo_root())
+    if a.which in (None, "latest"):
+        cands = sorted(list(pending.glob("*.md")) + list(sent.glob("*.md")), key=lambda p: p.stat().st_mtime)
+        if not cands:
+            print("ログなし", file=sys.stderr)
+            return 1
+        p = cands[-1]
+    else:
+        p = next((d / a.which for d in (pending, sent) if (d / a.which).exists()), None)
+        if not p:
+            print("見つからない", file=sys.stderr)
+            return 1
+    sys.stdout.write(p.read_text(encoding="utf-8"))
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="agent-log", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    t = sp.add_parser("turn")
+    for f in ("title", "purpose", "done", "tests", "failures", "todo", "pr"):
+        t.add_argument(f"--{f}")
+    t.add_argument("--json")
+    t.add_argument("--no-sync", action="store_true")
+    t.set_defaults(fn=cmd_turn)
+    s = sp.add_parser("sync"); s.add_argument("--quiet", action="store_true"); s.set_defaults(fn=cmd_sync)
+    sp.add_parser("status").set_defaults(fn=cmd_status)
+    sh = sp.add_parser("show"); sh.add_argument("which", nargs="?"); sh.set_defaults(fn=cmd_show)
+    sp.add_parser("redact").set_defaults(fn=lambda _a: (sys.stdout.write(redact(sys.stdin.read())), 0)[1])
+    a = ap.parse_args(argv)
+    try:
+        return a.fn(a)
+    except Exception as e:  # ログのせいで作業全体を止めない
+        print(f"agent-log: 予期しないエラー(作業は続行): {redact(repr(e))[:300]}", file=sys.stderr)
+        return 1 if strict() else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

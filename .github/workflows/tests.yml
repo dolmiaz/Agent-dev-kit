@@ -1,0 +1,30 @@
+name: Offline regression checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Shell regression tests
+        run: NO_NET=1 bash tests/run-tests.sh
+      - name: GitHub workflow mocks
+        run: python3 tests/test_agent_gh.py "$(mktemp -d)"
+      - name: Publication workflow mocks
+        run: python3 tests/test_publish.py "$(mktemp -d)"
+      - name: Public release checks
+        run: python3 tests/test_public_release.py
+      - name: Public file scan
+        run: |
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          python3 tools/publish-check.py . --history

@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {"type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR\"/.agent-kit/claude/session-start.sh", "timeout": 600, "statusMessage": "agent-kit: 依存を確認しています"}
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR\"/.agent-kit/claude/turn-start.sh", "timeout": 15}]}
+    ],
+    "PreToolUse": [
+      {"matcher": "Bash|Read|Edit|Write", "hooks": [{"type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.agent-kit/claude/pretool.py", "timeout": 10}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR\"/.agent-kit/claude/stop.sh", "timeout": 60}]}
+    ]
+  }
+}

@@ -1,0 +1,1520 @@
+#!/usr/bin/env python3
+"""skillsync — 個人用スキルを棚卸しし、版を固定してクラウド(Codex / Claude Code)へ配る。
+
+正本(一か所): スキル集リポジトリ(既定 `skills/<name>/` を持つ git リポジトリ。例: <owner>/agent-skills)
+配布先(各サービスが認識する場所。対象リポジトリの中):
+  Codex cloud            → .agents/skills/<name>/
+  Claude Code on the web → .claude/skills/<name>/
+版の記録: 対象リポジトリの .agent-kit/skills.lock.json(スキル名・正本のコミット・内容ハッシュ)
+
+サブコマンド
+  inventory <dir>...            Mac のスキル置き場を調べて分類(読み取りのみ)。--json / --md で出力
+  export <src-skill-dir> <bundle-repo> [--name N] [--force]
+                                Mac のスキルを正本へ取り込む(秘密・バイナリ・巨大ファイル・絶対パスを検査)
+  vendor <bundle-repo> <target-repo> [--skills a,b] [--set core,python] [--ref REF] [--targets codex,claude]
+         [--public-target] [--dry-run]
+                                正本の特定コミットから対象リポジトリへ配る。lock を更新(前の lock は .prev に退避)。
+                                セットは正本の sets.json。ライセンスと来歴(LICENSE*・UPSTREAM.json)を lock に記録。
+                                配布先が公開リポジトリなら --public-target が要り、再配布できると分かるものだけ配る
+  verify <target-repo> [--run]  配った内容が lock のハッシュと一致し、参照ファイル・スクリプトが壊れていないか確認。
+                                --run の代表処理は、lock の commit の正本の checks.json と同じときだけ実行する。
+                                --run で正本の checks.json の代表処理(確認済みのコマンドだけ)も実行
+  rollback <target-repo> --bundle B  直前の lock の状態へ戻す(復元元は --bundle の正本からだけ取り、全部取得・検証してから差し替える)
+  remove <target-repo> --skills a,b   lock に記録されたスキルだけを外す(どれかの配布先が手で変更されていればそのスキルは全部残す)
+  recover <target-repo>         vendor / rollback / remove がプロセスごと止まったときに、前の状態へ戻す
+
+vendor / rollback / remove は「全部の配布先を確認 → 一時領域で準備・検証 → まとめて差し替え」で動く。
+途中で失敗したら前の状態に戻し、lock は最後に書く(配布先と lock が食い違わない)。
+  zip <skill-dir> <out.zip>     claude.ai へ手動アップロードする用の zip(Claude のアカウントスキル)
+
+標準ライブラリのみ。git が必要(vendor / rollback)。
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+LOCK_REL = Path(".agent-kit/skills.lock.json")
+TARGET_DIRS = {"codex": Path(".agents/skills"), "claude": Path(".claude/skills")}
+MAX_FILE = 1_000_000        # 1MB を超えるファイルは配らない
+MAX_SKILL = 5_000_000       # 1スキル 5MB まで
+SKIP_NAMES = {".DS_Store", "__pycache__", "node_modules", ".git", ".venv"}
+
+# --- 依存・リスクの検出パターン ---------------------------------------------
+ABS_PATH = re.compile(r"(/Users/[A-Za-z0-9._-]+|/opt/homebrew|/Applications/|~/(?:Library|\.codex|\.claude|\.agents|\d{2}_[A-Za-z]+)[^\s`'\")]*|\$HOME/[^\s`'\")]+)")
+MAC_ONLY = re.compile(r"\b(osascript|launchctl|pbcopy|pbpaste|mdfind|xcrun|xcodebuild|security\s+(?:find|add)-|defaults\s+(?:read|write)|open\s+-a|plutil|diskutil)\b")
+# 資格情報のファイルらしい名前(credentials.json・client_secret.json・token.json・secrets.yaml 等)。
+# tokenizer.json・token-limits.txt・secret_santa.csv のような普通の名前は対象にしない
+SECRET_FILE = re.compile(r"((^|[._-])(credentials?|secrets?|tokens?|api[_-]?keys?|passwords?|passwd)(\.(json|ya?ml|toml|ini|cfg|conf|txt|env|properties))?$"
+                         r"|^client_secret.*\.json$|^ssh_host_.*_key$|^\.pgpass$|^kubeconfig$)", re.I)
+BACKUP_SUFFIX = re.compile(r"(\.(bak|old|orig|save|swp|tmp)|~)+$", re.I)
+SECRET_ENV = re.compile(r"\.env($|\.)", re.I)                       # .env・prod.env・.env.local・.env.sh(拡張子で除かない。env.py は対象外)
+SECRET_ENV_OK = re.compile(r"\.(example|sample|template|dist)$", re.I)
+SECRET_KEYFILE = re.compile(r"(\.(pem|p12|pfx|key|ppk|jks|keystore|kdbx|gpg)$|(^|[._-])id_(rsa|dsa|ecdsa|ed25519)$|(^|[._-])deploy[_-]?key$)", re.I)
+DOC_OR_CODE = (".md", ".py", ".js", ".cjs", ".mjs", ".ts", ".sh", ".rs")   # 説明・コード(credentials.json 等の設定・データは除外しない)
+SECRET_EXACT = re.compile(r"^(\.envrc|\.netrc|\.npmrc|\.pypirc|\.git-credentials|\.htpasswd)$", re.I)
+
+
+# 説明の見本: 語として区切られた your・here 等、または XXXX(本物のトークンの乱数の中の文字列には当てない)
+PLACEHOLDER = re.compile(r"((^|[-_])(your|here|example|placeholder|redacted|changeme|dummy-?token)([-_]|$)|xxxx|XXXX)")
+
+
+def secret_text(t: str) -> bool:
+    """秘密らしい文字列があるか。鍵の見出しは常に。トークンの形は、説明用の見本(your-…-here・XXXX 等)を除く"""
+    for m in SECRET_TEXT.finditer(t):
+        if m.group(0).startswith("-----BEGIN") or not PLACEHOLDER.search(m.group(0)):
+            return True
+    return False
+
+
+def secret_name(name: str) -> bool:
+    """秘密らしいファイル名か(配らない・梱包しない)。id_rsa.bak のようなバックアップの名前も、元の名前で判定する"""
+    base = BACKUP_SUFFIX.sub("", name)
+    if base != name and base and _secret_name(base):
+        return True
+    return _secret_name(name)
+
+
+def _secret_name(name: str) -> bool:
+    if SECRET_ENV.search(name) and not SECRET_ENV_OK.search(name) and not name.lower().endswith(".md"):
+        return True
+    if SECRET_KEYFILE.search(name) or SECRET_EXACT.search(name):
+        return True
+    return bool(SECRET_FILE.search(name)) and not name.lower().endswith(DOC_OR_CODE)
+SECRET_TEXT = re.compile(r"(-----BEGIN [A-Z ]*PRIVATE KEY( BLOCK)?-----|\bgh[pousr]_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9]{20,}_[A-Za-z0-9]{40,}"
+                         r"|\bsk-ant-[A-Za-z0-9_-]{20,}|\bsk-(proj-)?[A-Za-z0-9_-]{32,}|\bsk_live_[A-Za-z0-9]{20,}|\bAKIA[A-Z0-9]{16}\b"
+                         r"|\bxox[abprs]-\d+-[A-Za-z0-9-]{10,}|\bglpat-[A-Za-z0-9_-]{20}|\bAIza[0-9A-Za-z_-]{35}|\bGOCSPX-[A-Za-z0-9_-]{20,}"
+                         r"|\bnpm_[A-Za-z0-9]{36})")
+MCP_REF = re.compile(r"\b(mcp__[A-Za-z0-9_-]+|MCP server|MCPサーバ|\.mcp\.json)")
+AUTH_REF = re.compile(r"\b(API[_ ]?KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|GH_TOKEN|GITHUB_TOKEN|gh auth|op (?:read|item|run)|1Password|OAuth|access token|アクセストークン|認証)\b", re.I)
+# Vault の手掛かり: 番号つきフォルダ(例: 20_Notes/)。個人のフォルダ名は SKILLSYNC_PRIVATE_PATTERNS(正規表現)で足す
+VAULT_REF = re.compile(r"(Obsidian|\$VAULT|Vault|\b\d{2}_[A-Z][A-Za-z]+/)" +
+                       (("|" + os.environ["SKILLSYNC_PRIVATE_PATTERNS"]) if os.environ.get("SKILLSYNC_PRIVATE_PATTERNS") else ""))
+CLI_CANDIDATES = ["git", "gh", "node", "npm", "npx", "pnpm", "python3", "python", "uv", "pip", "rustc", "cargo",
+                  "go", "swift", "xcodebuild", "rclone", "jq", "rg", "curl", "docker", "playwright", "op", "codex",
+                  "claude", "openssl", "ssh-keygen", "ffmpeg", "pandoc", "latexmk", "osascript"]
+# スキルに同梱されているはずのファイルへの参照。docs/ は「対象リポジトリの docs」を指すことが多いので含めない。
+# {slug}・<話題>・YYYY・* のような置き換え前提の書き方も参照とみなさない
+REL_LINK = re.compile(r"(?:\]\(|`)((?:references|scripts|assets|templates|examples)/[^)`\s{}<>*]+)(?=[)`\s])")
+
+
+SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+class PathError(Exception):
+    pass
+
+
+def check_name(name: str) -> str:
+    """スキル名は1つの階層の名前だけ(/ .. 絶対パス・隠しファイル名は不可)"""
+    if not isinstance(name, str) or not SKILL_NAME.match(name) or set(name) <= {"."}:
+        raise PathError(f"スキル名として使えない: {name!r}(英数字と . _ - の1語)")
+    return name
+
+
+def child_dir(base: Path, name: str, root: Path | None = None) -> Path:
+    """base/name を、範囲の中に収まることを確かめてから返す。
+    root(配布先のリポジトリ・正本)を渡したときは、root から base までのどの階層もシンボリックリンクでなく、
+    base を解決した場所が root の中のその場所そのものであることも確かめる(.claude がリンクでも外へ出ない)。"""
+    check_name(name)
+    if root is not None:
+        rr = root.resolve()
+        rel = base.relative_to(root) if base.is_absolute() == root.is_absolute() else Path(os.path.relpath(base, root))
+        cur = root
+        for part in rel.parts:
+            cur = cur / part
+            if cur.is_symlink():
+                raise PathError(f"{cur} がシンボリックリンク(管理の範囲の外を指しうる)")
+        if base.exists() and base.resolve() != rr / rel:
+            raise PathError(f"{base} が {root} の中のその場所を指していない")
+    if base.is_symlink():
+        raise PathError(f"{base} がシンボリックリンク(管理の範囲の外を指しうる)")
+    d = base / name
+    if d.is_symlink():
+        raise PathError(f"{d} がシンボリックリンク(消すと範囲の外を消しうる)")
+    if d.resolve().parent != base.resolve():
+        raise PathError(f"{d} が {base} の外を指す")
+    return d
+
+
+def check_kit_dir(repo: Path) -> None:
+    """lock・journal・一時領域を置く .agent-kit と、その中で使うパスがシンボリックリンクでないこと"""
+    k = repo / ".agent-kit"
+    for q in (k, k / "tmp", repo / LOCK_REL, (repo / LOCK_REL).with_suffix(".prev.json"), repo / JOURNAL_REL):
+        if q.is_symlink():
+            raise PathError(f"{q} がシンボリックリンク(lock・記録・一時領域を範囲の外に書きうる)")
+    if k.exists() and k.resolve() != repo.resolve() / ".agent-kit":
+        raise PathError(f"{k} がリポジトリの中のその場所を指していない")
+
+
+def has_links(root: Path) -> list[str]:
+    """スキルの中のシンボリックリンク(copy_skill はリンクを写さないので、配った写しにあれば後から置かれたもの)"""
+    out = []
+    for dp, dns, fns in os.walk(root, onerror=_walk_error):
+        for x in dns + fns:
+            if (Path(dp) / x).is_symlink():
+                out.append((Path(dp) / x).relative_to(root).as_posix())
+    return out
+
+
+def sha_tree(root: Path) -> str:
+    h = hashlib.sha256()
+    for p in sorted(iter_files(root)):
+        if p.name == ".skillsync.json" and p.parent == root:
+            continue
+        rel = p.relative_to(root).as_posix()
+        h.update(rel.encode() + b"\0")
+        h.update(hashlib.sha256(p.read_bytes()).digest())
+    return h.hexdigest()
+
+
+def _walk_error(e: OSError):
+    raise e          # 読めないディレクトリを黙って飛ばさない(一部だけ写した・比べたことにしない)
+
+
+def iter_files(root: Path):
+    for dp, dns, fns in os.walk(root, onerror=_walk_error):
+        dns[:] = [d for d in dns if d not in SKIP_NAMES]
+        for f in fns:
+            if f in SKIP_NAMES:
+                continue
+            yield Path(dp) / f
+
+
+def frontmatter(text: str) -> dict:
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.S)
+    if not m:
+        return {}
+    out, key = {}, None
+    for line in m.group(1).splitlines():
+        km = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", line)
+        if km:
+            key = km.group(1)
+            out[key] = km.group(2).strip().strip('"').strip("'")
+        elif key and line.startswith((" ", "\t")):
+            out[key] = (out[key] + " " + line.strip()).strip(" >|-")
+    return out
+
+
+def is_text(p: Path) -> bool:
+    import codecs
+    data = p.read_bytes()[:65536]
+    if b"\0" in data:
+        return False
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(data, final=False)   # 途中で切れた多バイト文字は許す
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+FENCE = re.compile(r"```.*?```|`[^`\n]+`", re.S)
+
+
+def code_parts(rel: str, text: str) -> str:
+    """依存の検出対象: スクリプトは全文、Markdown 等はコードブロックとインラインコードだけ(本文の話題は依存にしない)"""
+    if rel.endswith((".md", ".txt", ".yaml", ".yml", ".json")):
+        return "\n".join(FENCE.findall(text))
+    return text
+
+
+# --- inventory ---------------------------------------------------------------
+def analyze(skill: Path) -> dict:
+    info = {"name": skill.name, "path": str(skill), "files": 0, "bytes": 0, "has_skill_md": False,
+            "frontmatter_ok": False, "description": "", "symlinks": [], "binaries": [], "large": [],
+            "secret_files": [], "secret_text": [], "abs_paths": [], "mac_only": [], "mcp": [], "auth": [],
+            "vault": False, "clis": [], "scripts": [], "missing_refs": [], "notes": []}
+    if skill.is_symlink():
+        info["symlinks"].append(f"{skill.name} -> {os.readlink(skill)}")
+    sm = skill / "SKILL.md"
+    if sm.is_file():
+        info["has_skill_md"] = True
+        fm = frontmatter(sm.read_text(encoding="utf-8", errors="replace"))
+        info["frontmatter_ok"] = bool(fm.get("name") and fm.get("description"))
+        info["description"] = fm.get("description", "")[:160]
+    alltext = ""
+    for p in iter_files(skill):
+        rel = p.relative_to(skill).as_posix()
+        if rel == ".skillsync.json":       # 取り込み元の記録(このツールが書いたもの)はスキルの中身ではない
+            continue
+        if p.is_symlink():
+            info["symlinks"].append(f"{rel} -> {os.readlink(p)}")
+            continue
+        size = p.stat().st_size
+        info["files"] += 1
+        info["bytes"] += size
+        if size > MAX_FILE:
+            info["large"].append(rel)
+        if secret_name(p.name):
+            info["secret_files"].append(rel)
+        if rel.startswith("scripts/") or p.suffix in (".py", ".sh", ".js", ".cjs", ".mjs", ".rs") or os.access(p, os.X_OK):
+            info["scripts"].append(rel)
+        # 秘密らしい文字列は、文字コードに関係なく全ファイルのバイト列で探す(UTF-8 でないファイルも見逃さない)
+        raw = p.read_bytes()
+        # Latin-1 で全バイトを文字にし、NUL を除いたもの(UTF-16 の ASCII 部分)も見る
+        if secret_text(raw.decode("latin-1")) or (b"\x00" in raw and secret_text(raw.replace(b"\x00", b"").decode("latin-1"))):
+            info["secret_text"].append(rel)
+        if not is_text(p):
+            info["binaries"].append(rel)
+            continue
+        t = p.read_text(encoding="utf-8", errors="replace")
+        alltext += "\n" + t
+        code = code_parts(rel, t)
+        for pat, key, src in ((ABS_PATH, "abs_paths", t), (MAC_ONLY, "mac_only", code), (MCP_REF, "mcp", code), (AUTH_REF, "auth", code)):
+            for m in pat.finditer(src):
+                v = f"{rel}: {m.group(0)}"
+                if v not in info[key] and len(info[key]) < 12:
+                    info[key].append(v)
+    info["vault"] = bool(VAULT_REF.search(alltext))
+    for c in CLI_CANDIDATES:
+        if re.search(rf"(^|[\s`$(]){re.escape(c)}\s", alltext, re.M):
+            info["clis"].append(c)
+    if sm.is_file():
+        for m in REL_LINK.finditer(sm.read_text(encoding="utf-8", errors="replace")):
+            ref = m.group(1).rstrip(".,")
+            if not (skill / ref).exists():
+                info["missing_refs"].append(ref)
+    info["class"], info["reason"] = classify(info)
+    return info
+
+
+def classify(i: dict) -> tuple[str, str]:
+    if not i["has_skill_md"]:
+        return "skip", "SKILL.md が無い(空のディレクトリ等)"
+    if i["secret_files"] or i["secret_text"]:
+        return "blocked", "秘密情報らしきファイル・文字列があるため配らない(要確認)"
+    if i["bytes"] > MAX_SKILL or i["large"]:
+        return "blocked", "サイズ超過(1ファイル1MB / 1スキル5MB)"
+    mac = [x for x in i["mac_only"]]
+    home_abs = [x for x in i["abs_paths"] if "/Users/" in x and (x.startswith("SKILL.md") or x.startswith("scripts/"))]
+    if home_abs or (i["vault"] and i["abs_paths"]):
+        return "mac-only", "Mac の Vault・鍵など手元のファイルに依存(クラウドでは代替か Mac へ引継ぎ)"
+    if mac:
+        return "mac-only", "macOS 専用コマンドに依存"
+    if i["abs_paths"]:
+        return "adapt", "絶対パスがある(相対パスか環境変数に直せばクラウド可)"
+    if i["mcp"]:
+        return "adapt", "MCP に依存(クラウドで同じ MCP / コネクタが使えるか確認)"
+    if i["auth"]:
+        return "adapt", "認証情報・API キーに言及(クラウドでの渡し方を決める)"
+    if i["missing_refs"]:
+        return "adapt", "SKILL.md が参照するファイルが無い"
+    return "cloud-ok", "手元に依存しない(そのまま配れる)"
+
+
+def cmd_inventory(a) -> int:
+    rows = []
+    for d in a.dirs:
+        base = Path(d).expanduser()
+        if not base.is_dir():
+            print(f"skip (not a dir): {d}", file=sys.stderr)
+            continue
+        for s in sorted(base.iterdir()):
+            if s.name.startswith(".") and not a.include_hidden:
+                continue
+            if s.is_dir():
+                r = analyze(s)
+                r["source_root"] = str(base)
+                rows.append(r)
+    if a.json:
+        Path(a.json).write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    md = ["| スキル | 置き場 | 分類 | 理由 | ファイル | 参照・スクリプト | CLI | MCP/認証/絶対パス |",
+          "|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        deps = []
+        if r["mcp"]:
+            deps.append("MCP")
+        if r["auth"]:
+            deps.append("認証")
+        if r["abs_paths"]:
+            deps.append("絶対パス")
+        if r["mac_only"]:
+            deps.append("macOS専用")
+        if r["vault"]:
+            deps.append("Vault")
+        md.append(f"| {r['name']} | {Path(r['source_root']).name} | **{r['class']}** | {r['reason']} | "
+                  f"{r['files']} ({r['bytes']//1024}KB) | {len(r['scripts'])} scripts | {', '.join(r['clis'][:8])} | "
+                  f"{', '.join(deps) or '-'} |")
+    text = "\n".join(md) + "\n"
+    if a.md:
+        Path(a.md).write_text(text, encoding="utf-8")
+    else:
+        print(text)
+    counts = {}
+    for r in rows:
+        counts[r["class"]] = counts.get(r["class"], 0) + 1
+    print("集計: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())), file=sys.stderr)
+    return 0
+
+
+# --- export ------------------------------------------------------------------
+def cmd_export(a) -> int:
+    src = Path(a.src).expanduser().resolve()
+    info = analyze(src)
+    name = a.name or src.name
+    if info["class"] in ("blocked", "skip"):
+        print(f"取り込まない: {name}: {info['reason']}", file=sys.stderr)
+        return 2
+    if info["class"] == "mac-only" and not a.force:
+        print(f"取り込まない: {name}: {info['reason']}(--force で取り込めるが、クラウドでは動かない)", file=sys.stderr)
+        return 2
+    if info["symlinks"]:
+        print(f"注意: シンボリックリンクは実体をコピーしない: {info['symlinks']}", file=sys.stderr)
+    try:
+        broot = Path(a.bundle).expanduser().resolve()
+        if broot == src or src in broot.parents:
+            raise PathError(f"正本 {broot} がスキルのディレクトリの中にある(自分自身を取り込んでしまう)")
+        base = broot / "skills"
+        if base.is_symlink():
+            raise PathError(f"{base} がシンボリックリンク")
+        base.mkdir(parents=True, exist_ok=True)
+        dst = child_dir(base, name, broot)
+    except PathError as e:
+        print(f"取り込まない: {e}", file=sys.stderr)
+        return 2
+    meta = {"name": name, "exported_from": str(src).replace(str(Path.home()), "~"),   # 時刻は入れない(同じ中身なら同じ記録)
+            "class": info["class"], "reason": info["reason"], "clis": info["clis"],
+            "abs_paths": info["abs_paths"], "mcp": info["mcp"], "auth": info["auth"]}
+    meta_text = json.dumps(meta, ensure_ascii=False, indent=2)
+    mp = dst / ".skillsync.json"
+    if dst.is_dir() and sha_tree(dst) == copied_tree(src):
+        if mp.is_file() and not mp.is_symlink() and mp.read_text(encoding="utf-8") == meta_text:
+            print(f"unchanged: {name}(正本の中身と同じ)")
+            return 0
+        # 中身は同じで、判定(分類・理由)だけが変わった: 記録を新しい判定に合わせる
+        mp.unlink(missing_ok=True)
+        mp.write_text(meta_text, encoding="utf-8")
+        print(f"updated: {name} の判定の記録({info['class']})")
+        return 0
+    if dst.exists():
+        shutil.rmtree(dst)
+    copy_skill(src, dst)
+    mp.write_text(meta_text, encoding="utf-8")
+    print(f"exported: {name} ({info['class']}) → {dst}")
+    return 0
+
+
+def copied(src: Path, p: Path) -> bool:
+    """copy_skill が写すファイルか(シンボリックリンク・1MB 超・秘密らしい名前・取り込み元の記録は写さない)"""
+    if p.is_symlink() or (p.name == ".skillsync.json" and p.parent == src):
+        return False
+    return not (p.stat().st_size > MAX_FILE or secret_name(p.name))
+
+
+def copied_tree(src: Path) -> str:
+    """copy_skill で写した結果と同じになるハッシュ(sha_tree と同じ計算)"""
+    h = hashlib.sha256()
+    for p in sorted(x for x in iter_files(src) if copied(src, x)):
+        h.update(p.relative_to(src).as_posix().encode() + b"\0")
+        h.update(hashlib.sha256(p.read_bytes()).digest())
+    return h.hexdigest()
+
+
+def copy_skill(src: Path, dst: Path) -> None:
+    for p in iter_files(src):
+        if not copied(src, p):
+            continue
+        rel = p.relative_to(src)
+        out = dst / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, out)
+
+
+# --- vendor / verify / rollback / remove ---------------------------------------
+def git(*args, cwd=None) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+_NOTED: set[str] = set()
+
+
+def bundle_location(bundle: str) -> str:
+    """lock に書く正本の場所(lock はコミットされ、公開されうる)。
+    - 手元のディレクトリ: ホームの下なら ~ からの道のり。ホームの外なら、その正本の origin の URL(無ければ絶対パスで、注意を出す)
+    - URL: 認証情報(user:token@)を取り除く
+    rollback は --bundle で指定した正本から取り直す(.prev に書かれた場所は使わない)。"""
+    from urllib.parse import urlsplit, urlunsplit
+    p = Path(bundle).expanduser()
+    if p.is_dir():
+        real = str(p.resolve())
+        home = str(Path.home().resolve())
+        if real == home or real.startswith(home + os.sep):
+            return "~" + real[len(home):]
+        origin = subprocess.run(["git", "-C", real, "remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip()
+        if origin:
+            return bundle_location(origin)
+        if real not in _NOTED:
+            _NOTED.add(real)
+            print(f"注: 正本の場所 {real} をそのまま lock に記録する(ホームの外で origin も無い)", file=sys.stderr)
+        return real
+    u = urlsplit(bundle)
+    if u.scheme and "@" in u.netloc:
+        return urlunsplit((u.scheme, u.netloc.rsplit("@", 1)[1], u.path, u.query, u.fragment))
+    return bundle
+
+
+def checkout_bundle(bundle: str, ref: str | None) -> tuple[Path, str, str]:
+    """正本を ref の内容で一時ディレクトリに取り出す。戻り値: (skills_dir, commit, tmpdir)"""
+    tmp = tempfile.mkdtemp(prefix="skillsync-")
+    src = bundle
+    if Path(bundle).expanduser().is_dir():
+        src = str(Path(bundle).expanduser().resolve())
+    git("clone", "--quiet", "--", src, tmp)
+    if ref:
+        git("checkout", "--quiet", ref, cwd=tmp)
+    commit = git("rev-parse", "HEAD", cwd=tmp)
+    return Path(tmp) / "skills", commit, tmp
+
+
+def load_lock(repo: Path) -> dict:
+    p = repo / LOCK_REL
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {"version": 1, "skills": {}}
+
+
+def write_json_atomic(p: Path, data: dict) -> None:
+    write_text_atomic(p, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- 配布先の変更をまとめて行う(途中で失敗しても前の状態に戻す) ------------------
+JOURNAL_REL = Path(".agent-kit/skillsync-journal.json")
+
+
+class Deploy:
+    """1. 全部確認する(呼び出し側) 2. 一時領域へ準備して検証する(stage) 3. まとめて差し替える(commit)。
+    差し替えは rename だけで行い、前の内容は一時領域に退避する。失敗したら逆順に戻す。
+    プロセスが落ちた場合は journal が残るので `skillsync recover` で戻せる(lock は最後に書くので古いまま)。"""
+
+    def __init__(self, repo: Path):
+        self.repo = repo
+        self.work = repo / ".agent-kit" / "tmp" / f"skillsync-{os.getpid()}-{os.urandom(3).hex()}"
+        self.ops: list[dict] = []          # {"dst", "new" or None}
+
+    def stage(self, name: str, target: str, src: Path) -> str:
+        """src を一時領域へ写して検証し、内容ハッシュを返す。問題があれば例外。"""
+        try:
+            child_dir(self.repo / TARGET_DIRS[target], name, self.repo)
+        except PathError as e:
+            raise DeployError(str(e))
+        staged = self.work / "new" / target / name
+        check_kit_dir(self.repo)
+        copy_skill(src, staged)
+        (staged / ".skillsync.json").unlink(missing_ok=True)    # 取り込み元の記録は正本にだけ残す
+        errs = [e for e in check_skill_dir(staged) if not e.startswith("絶対パス")]
+        src_errs = set(check_skill_dir(src))
+        # 元のスキル(正本)にも無い参照は、写しの問題ではなくスキル自体の欠け。注意として残し、配布は止めない
+        inherited = [e for e in errs if e.startswith("参照ファイルが無い") and e in src_errs]
+        for e in inherited:
+            print(f"注意: {name}: {e}(正本にも無い。スキル自体の欠け)", file=sys.stderr)
+        errs = [e for e in errs if e not in inherited]
+        if errs:
+            raise DeployError(f"{name} [{target}]: 準備した内容の検証に失敗: {'; '.join(errs)}")
+        h = sha_tree(staged)
+        dst = child_dir(self.repo / TARGET_DIRS[target], name, self.repo)
+        if dst.is_dir() and sha_tree(dst) == h:
+            shutil.rmtree(staged)           # 中身が同じなら差し替えない(rollback の戻り先も変えない)
+        else:
+            self.ops.append({"dst": str(dst), "new": str(staged), "hash": h})
+        return h
+
+    def remove(self, name: str, target: str) -> None:
+        try:
+            dst = child_dir(self.repo / TARGET_DIRS[target], name, self.repo)
+        except PathError as e:
+            raise DeployError(str(e))
+        self.ops.append({"dst": str(dst), "new": None})
+
+    def commit(self, lock: dict) -> bool:
+        """差し替えて lock を書く。変えるものが無ければ何もしない(rollback の戻り先 .prev を上書きしない)。"""
+        journal = self.repo / JOURNAL_REL
+        if journal.exists():
+            raise DeployError(f"前回の途中で止まった記録がある({JOURNAL_REL})。先に `skillsync recover` を実行する")
+        lp = self.repo / LOCK_REL
+        if not self.ops and same_lock(load_lock(self.repo), lock):
+            self.abort()
+            return False
+        for i, op in enumerate(self.ops):
+            op["old"] = str(self.work / "old" / str(i))
+            d0 = Path(op["dst"])
+            op["had_old"] = d0.exists()            # recover が「前の内容がどこかに残っているか」を確かめるため
+            op["old_hash"] = sha_tree(d0) if d0.is_dir() else ""
+        lock_text = json.dumps(lock, ensure_ascii=False, indent=2) + "\n"
+        prev_p = lp.with_suffix(".prev.json")
+        old_lock = lp.read_text(encoding="utf-8") if lp.exists() else None
+        old_prev = prev_p.read_text(encoding="utf-8") if prev_p.exists() else None
+        check_kit_dir(self.repo)
+        self.work.mkdir(parents=True, exist_ok=True)
+        # journal には、元に戻すのに要るもの(前の lock と .prev の中身)も入れる
+        write_json_atomic(journal, {"work": str(self.work), "ops": self.ops, "old_lock": old_lock, "old_prev": old_prev,
+                                    "new_lock_sha": hashlib.sha256(lock_text.encode()).hexdigest()})
+        try:
+            for i, op in enumerate(self.ops):
+                _maybe_fail(i)
+                dst = Path(op["dst"])
+                if dst.exists():
+                    Path(op["old"]).parent.mkdir(parents=True, exist_ok=True)
+                    os.rename(dst, op["old"])
+                    op["moved_old"] = True
+                if op["new"]:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    os.rename(op["new"], dst)
+                    op["placed"] = True
+            _maybe_fail(len(self.ops))
+            write_json_atomic(lp, lock)
+            _maybe_fail_point("after-lock")
+            if old_lock is not None:          # lock を書けてから戻り先を更新する
+                write_text_atomic(prev_p, old_lock, fail_point="prev")
+            _maybe_fail(len(self.ops) + 1)    # テスト用: lock・.prev を書いた後、journal を消す前に落ちる
+        except BaseException as e:
+            try:
+                _maybe_fail_point("undo")
+                undo(self.ops)
+                restore_meta(lp, old_lock, old_prev)
+            except Exception as ue:
+                # 戻せなかった: 退避した前の内容(一時領域)と journal を残し、recover に任せる
+                raise DeployError(f"差し替えに失敗し、元にも戻せなかった({type(ue).__name__}: {ue})。"
+                                  f"一時領域と記録を残した。`skillsync recover {self.repo}` を実行する") from e
+            journal.unlink(missing_ok=True)
+            shutil.rmtree(self.work, ignore_errors=True)
+            _cleanup_tmp(self.repo)
+            raise
+        journal.unlink(missing_ok=True)
+        shutil.rmtree(self.work, ignore_errors=True)
+        _cleanup_tmp(self.repo)
+        return True
+
+    def abort(self) -> None:
+        shutil.rmtree(self.work, ignore_errors=True)
+        _cleanup_tmp(self.repo)
+
+
+class DeployError(Exception):
+    pass
+
+
+def report_deploy(e: "DeployError", repo: Path) -> int:
+    if (repo / JOURNAL_REL).exists():
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    return report([str(e)])
+
+
+def same_lock(a: dict, b: dict) -> bool:
+    strip = lambda d: {k: v for k, v in d.items() if k != "updated_at"}
+    return strip(a) == strip(b)
+
+
+def undo(ops: list[dict]) -> None:
+    """差し替えを逆順に戻す。placed = 新しい内容を置いた、moved_old = 前の内容を退避した"""
+    for op in reversed(ops):
+        dst, old = Path(op["dst"]), Path(op["old"])
+        for q in (old, old.parent, dst):
+            if q.is_symlink():
+                raise PathError(f"{q} がシンボリックリンク(戻さない)")
+        if op.get("placed") and dst.exists():
+            shutil.rmtree(dst)
+        if op.get("moved_old") and old.exists():
+            os.rename(old, dst)
+
+
+def _cleanup_tmp(repo: Path) -> None:
+    try:
+        (repo / ".agent-kit" / "tmp").rmdir()     # 空なら消す(他の作業中のものがあれば残る)
+    except OSError:
+        pass
+
+
+def write_text_atomic(p: Path, text: str, fail_point: str = "") -> None:
+    """同じディレクトリの一意な一時ファイル(O_EXCL|O_NOFOLLOW で新規に作る)に書いてから置き換える。
+    置き先や親がシンボリックリンクなら書かない(リンクを辿って範囲の外を上書きしない)"""
+    if p.is_symlink():
+        raise PathError(f"{p} がシンボリックリンク(書かない)")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.parent.is_symlink():
+        raise PathError(f"{p.parent} がシンボリックリンク(書かない)")
+    tmp = p.with_name(f".{p.name}.{os.getpid()}-{os.urandom(4).hex()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        if fail_point:
+            _maybe_fail_point(fail_point)
+        os.replace(tmp, p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def restore_meta_prev_only(lp: Path, old_prev: str | None) -> None:
+    prev_p = lp.with_suffix(".prev.json")
+    if old_prev is None:
+        prev_p.unlink(missing_ok=True)
+    elif not prev_p.exists() or prev_p.read_text(encoding="utf-8") != old_prev:
+        write_text_atomic(prev_p, old_prev)
+
+
+def restore_meta(lp: Path, old_lock: str | None, old_prev: str | None) -> None:
+    """lock と .prev を、配布を始める前の中身に戻す(無かったものは消す)"""
+    prev_p = lp.with_suffix(".prev.json")
+    for path, text in ((lp, old_lock), (prev_p, old_prev)):
+        if text is None:
+            path.unlink(missing_ok=True)
+        elif not path.exists() or path.read_text(encoding="utf-8") != text:
+            write_text_atomic(path, text)
+    for t in [*lp.parent.glob(f".{lp.name}.*.tmp"), *lp.parent.glob(f".{prev_p.name}.*.tmp")]:
+        if not t.is_symlink():
+            t.unlink(missing_ok=True)
+
+
+def _maybe_fail_point(name: str) -> None:
+    """テスト用: SKILLSYNC_FAIL_POINT=after-lock|prev|undo で例外、SKILLSYNC_CRASH_POINT=同じ名前でプロセスごと落とす"""
+    if os.environ.get("SKILLSYNC_FAIL_POINT") == name:
+        raise OSError(f"(テスト用の失敗: {name})")
+    if os.environ.get("SKILLSYNC_CRASH_POINT") == name:
+        os._exit(9)
+
+
+def _maybe_fail(step: int) -> None:
+    """テスト用: SKILLSYNC_FAIL_AT=n で n 回目の差し替えの前に例外、SKILLSYNC_CRASH_AT=n でプロセスごと落とす"""
+    if os.environ.get("SKILLSYNC_FAIL_AT") == str(step):
+        raise DeployError(f"(テスト用の失敗: 差し替え {step} 件目の前)")
+    if os.environ.get("SKILLSYNC_CRASH_AT") == str(step):
+        os._exit(9)
+
+
+def journal_problem(repo: Path, j: dict) -> str:
+    """journal の中のパスが、この配布の一時領域・管理の範囲の中だけを指すか(書き換えられた journal で外を消さない)"""
+    tmp_root = (repo / ".agent-kit" / "tmp").resolve()
+    work = Path(str(j.get("work", "")))
+    if not work.is_absolute() or work.parent != repo / ".agent-kit" / "tmp" or not re.fullmatch(r"skillsync-\d+-[0-9a-f]{6}", work.name):
+        return f"一時領域のパスが範囲の外({work})"
+    if work.exists() and (work.is_symlink() or work.resolve().parent != tmp_root):
+        return f"一時領域がリンク・範囲の外({work})"
+    ops = j.get("ops")
+    if not isinstance(ops, list):
+        return "ops の形が違う"
+    allowed = {}
+    for t, rel in TARGET_DIRS.items():
+        allowed[str(repo / rel)] = t
+    for i, op in enumerate(ops):
+        if not isinstance(op, dict):
+            return "ops の形が違う"
+        dst = Path(str(op.get("dst", "")))
+        if str(dst.parent) not in allowed:
+            return f"差し替え先が管理のディレクトリの外({dst})"
+        try:
+            child_dir(dst.parent, dst.name, repo)
+        except PathError as e:
+            return str(e)
+        if op.get("old") != str(work / "old" / str(i)):
+            return f"退避先が一時領域の外({op.get('old')})"
+        new = op.get("new")
+        if new is not None and Path(str(new)).parent.parent != work / "new":
+            return f"新しい内容の場所が一時領域の外({new})"
+        for q in (work / "old", work / "new", Path(op["old"]), *( [Path(str(new)), Path(str(new)).parent] if new else [])):
+            if q.is_symlink():
+                return f"一時領域の中にシンボリックリンクがある({q})"
+    return ""
+
+
+def recover_kept_dir(repo: Path) -> Path:
+    """recover が消さずに退けた内容の置き場(リポジトリの外の状態ディレクトリ。commit されない)"""
+    base = os.environ.get("AGENT_STATE_DIR") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(str(Path.home()), ".local", "state"), "agent-kit")
+    key = re.sub(r"[^A-Za-z0-9._-]", "_", repo.name)[:40] + "-" + hashlib.sha256(str(repo).encode()).hexdigest()[:12]
+    return Path(base) / "skillsync-recover-kept" / key / f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+
+
+class RecoverStop(Exception):
+    """journal と、ディスクの実際の状態(lock・.prev・配布先・退避先)が合わない。何も変える前に止まる"""
+
+
+def _lock_targets(text: str | None) -> dict:
+    """lock の文字列 → {(name, target): hash}。名前・配布先が不正なら RecoverStop"""
+    try:
+        d = json.loads(text) if text else {"skills": {}}
+        out = {}
+        for n, e in d["skills"].items():
+            check_name(n)
+            for t, h in e.get("targets", {}).items():
+                if t not in TARGET_DIRS or not isinstance(h, str):
+                    raise RecoverStop(f"lock の配布先が不正({n} [{t}])")
+                out[(n, t)] = h
+        return out
+    except (ValueError, KeyError, TypeError, AttributeError, PathError) as e:
+        raise RecoverStop(f"lock を読めない({type(e).__name__})")
+
+
+def _op_key(repo: Path, op: dict) -> tuple[str, str]:
+    dst = Path(op["dst"])
+    for t, rel in TARGET_DIRS.items():
+        if dst.parent == repo / rel:
+            return dst.name, t
+    raise RecoverStop(f"差し替え先が管理のディレクトリの外({dst})")
+
+
+def _recover_plan_and_apply(repo: Path, j: dict, ops: list, lp: Path, cur_lock: str | None, cur_sha: str | None) -> str:
+    """recover の本体。journal は書き換えられうるので、journal だけを根拠にしない:
+    - 「前の内容」はディスクの lock(書く前に止まったなら前の lock そのもの)のハッシュで判定する(journal の old_hash は使わない)
+    - 検証済みの退避(一時領域の old の中身が、ディスクの lock のハッシュと一致)が無い既存の内容は消さない
+    - 消す代わりにリポジトリの外(状態ディレクトリの skillsync-recover-kept/)へ移して残す(recover は rmtree しない)
+    - 計画を全部立て、どれか1つでも合わなければ、何も変える前に止まる"""
+    old_lock = j.get("old_lock")
+    prev_p = lp.with_suffix(".prev.json")
+    cur_prev = prev_p.read_text(encoding="utf-8") if prev_p.is_file() else None
+    if old_lock is not None and j.get("new_lock_sha") == hashlib.sha256(old_lock.encode()).hexdigest():
+        raise RecoverStop("journal の新しい lock が前の lock と同じ(本物の配布では起きない)")
+    keys = [_op_key(repo, op) for op in ops]
+    if len(set(keys)) != len(keys):
+        raise RecoverStop("journal に同じ配布先の op が2つある")
+    if cur_lock == old_lock:          # lock を書く前に止まった(初めての配布で lock がまだ無い場合も、どちらも None で同じ)
+        # --- lock を書く前に止まった: 配布先を、ディスクの lock どおりの前の状態へ戻す ---
+        if cur_prev != j.get("old_prev"):
+            raise RecoverStop(".prev が journal の記録と違う(lock を書く前なら .prev は変わっていないはず)")
+        before = _lock_targets(cur_lock)
+        plan = []           # (動作, 引数)
+        for i, (op, key) in enumerate(zip(ops, keys)):
+            dst, oldp = Path(op["dst"]), Path(op["old"])
+            for q in (dst, oldp, oldp.parent):
+                if q.is_symlink():
+                    raise RecoverStop(f"{q} がシンボリックリンク")
+            want = before.get(key)                       # 前にあった内容のハッシュ(ディスクの lock から)
+            have = sha_tree(dst) if dst.is_dir() else None
+            if dst.exists() and not dst.is_dir():
+                raise RecoverStop(f"{dst} がディレクトリでない")
+            if have is not None and has_links(dst):
+                raise RecoverStop(f"{dst} の中にシンボリックリンクがある")
+            backup_ok = (oldp.is_dir() and not has_links(oldp) and want is not None and sha_tree(oldp) == want)
+            if oldp.exists() and not backup_ok:
+                raise RecoverStop(f"一時領域の退避 {oldp} の中身が、前の lock の内容と違う")
+            if want is not None:
+                if have == want:
+                    continue                             # 前の内容がそのまま残っている: 何もしない(消さない)
+                if not backup_ok:
+                    raise RecoverStop(f"{dst}: 前の内容の検証済みの退避が無い(戻すと失う)")
+                if have is not None:
+                    # 今ある内容は、置いた新しい写しでも手の変更でも消さずに退ける
+                    plan.append(("keep", dst, i))       # recover は消さない(journal の hash だけでは置いた写しと決めない)
+                plan.append(("restore", oldp, dst))
+            else:
+                if have is None:
+                    continue                             # 前も今も無い
+                if op.get("new") is None or have != op.get("hash"):
+                    raise RecoverStop(f"{dst}: 前の lock に無いのに、置いた新しい写しとも違う内容がある(本人のもの?)")
+                plan.append(("keep", dst, i))            # 新しく置いた写し: 消さずに退ける
+        kept = recover_kept_dir(repo)
+        for act, a1, a2 in plan:
+            if act == "keep":
+                dest = kept / str(a2) / a1.parent.parent.name / a1.name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(a1), str(dest))
+            else:
+                os.rename(a1, a2)
+        msg = f"途中で止まった配布を戻した({len(plan)} 件の操作)。lock と .prev は前のまま(書き換えていない)"
+        if any(p[0] == "keep" for p in plan):
+            msg += f"。前の lock に無い・置いた写しと確かめられない内容は消さずに {kept} へ移した(確かめてから消す)"
+        return msg
+    if cur_sha is not None and cur_sha == j.get("new_lock_sha"):
+        # --- lock まで書き終えてから止まった: 配布先は全部、ディスクの(新しい)lock どおりのはず。違えば止まる ---
+        after = _lock_targets(cur_lock)
+        for op, key in zip(ops, keys):
+            dst = Path(op["dst"])
+            want = after.get(key)
+            if want is None:
+                if dst.exists():
+                    raise RecoverStop(f"{dst}: 新しい lock に無いのに残っている")
+            elif not (dst.is_dir() and not dst.is_symlink() and not has_links(dst) and sha_tree(dst) == want):
+                raise RecoverStop(f"{dst}: 新しい lock の内容と違う(配布が完了していない)")
+        if cur_prev not in (j.get("old_prev"), old_lock):
+            raise RecoverStop(".prev が journal の前の .prev とも前の lock とも違う")
+        if old_lock is not None:
+            # journal の前の lock を .prev にする前に、ディスクの実際の状態と突き合わせる:
+            # 触っていない配布先は新旧の lock で同じ、触った配布先で前に内容があったものは一時領域に検証済みの退避がある
+            before = _lock_targets(old_lock)
+            for k in (set(before) | set(after)) - set(keys):
+                if before.get(k) != after.get(k):
+                    raise RecoverStop(f"journal の前の lock が、触っていない配布先 {k[0]} [{k[1]}] で今の lock と違う")
+            if not ops:
+                # 差し替えの無い配布(lock の記録だけが変わった): 前の lock を確かめる手掛かり(退避)が無い
+                return "配布は完了していた(lock も新しい)。差し替えが無かったので、戻り先(.prev)は journal から更新していない"
+            unverified = []
+            for i, (op, k) in enumerate(zip(ops, keys)):
+                oldp = Path(op["old"])
+                if op.get("new") and Path(str(op["new"])).exists():
+                    raise RecoverStop(f"準備した写し {op['new']} が置かれないまま残っている(配布は完了していない)")
+                if before.get(k) is not None:
+                    if not (oldp.is_dir() and not oldp.is_symlink() and not has_links(oldp) and sha_tree(oldp) == before[k]):
+                        raise RecoverStop(f"journal の前の lock の {k[0]} [{k[1]}] に当たる退避が一時領域に無い")
+                else:
+                    if oldp.exists():
+                        raise RecoverStop(f"journal の前の lock に無い {k[0]} [{k[1]}] の退避がある")
+                    unverified.append(f"{k[0]} [{k[1]}]")
+            if unverified:
+                # 前の lock に無い配布先は、前の lock が本物か確かめる手掛かりが無い。戻り先(.prev)は journal から書かない
+                return ("配布は完了していた(lock も新しい)。ただし journal の前の lock を確かめられない配布先がある"
+                        f"({', '.join(unverified)})ので、戻り先(.prev)は更新していない(rollback は1つ前ではなく、その前の状態に戻る)")
+            if cur_prev != old_lock:
+                write_text_atomic(prev_p, old_lock)
+        return "配布は完了していた(lock も新しい)。.prev をそろえ、一時領域と記録を片付けた"
+    raise RecoverStop("今の lock が、journal の前の lock とも新しい lock とも違う")
+
+
+def cmd_recover(a) -> int:
+    """途中で止まった配布を、整合した状態(全部新しい / 全部前のまま)にする。できなければ journal を残して止まる"""
+    repo = Path(a.repo).resolve()
+    journal = repo / JOURNAL_REL
+    if not journal.exists():
+        print("戻すものは無い(途中で止まった記録なし)")
+        return 0
+    tracked = subprocess.run(["git", "-C", str(repo), "ls-files", "--error-unmatch", "--", str(JOURNAL_REL)],
+                             capture_output=True, text=True).returncode == 0
+    if tracked:      # skillsync は journal を commit しない。commit されたもの(PR 等で持ち込まれたもの)は使わない
+        print(f"error: {JOURNAL_REL} が git に commit されている。skillsync が書いたものではないので使わない。何も変えない",
+              file=sys.stderr)
+        return 2
+    try:
+        j = json.loads(journal.read_text(encoding="utf-8"))
+        problem = journal_problem(repo, j)
+    except (OSError, json.JSONDecodeError, TypeError, KeyError, AttributeError) as e:
+        problem = f"記録を読めない({type(e).__name__})"
+    if problem:
+        print(f"error: {JOURNAL_REL} の内容が想定と違う: {problem}。記録を信用できないので何も変えない。"
+              f"配布先と lock を手で確かめてから記録を消す", file=sys.stderr)
+        return 2
+    ops = j["ops"]
+    lp = repo / LOCK_REL
+    # lock は最後に書くので、今の lock は「新しい lock」か「journal の前の lock」のどちらかのはず。違えば journal を信用しない
+    cur_lock = lp.read_text(encoding="utf-8") if lp.is_file() else None
+    cur_sha = hashlib.sha256(cur_lock.encode()).hexdigest() if cur_lock is not None else None
+    if cur_sha != j.get("new_lock_sha") and cur_lock != j.get("old_lock"):
+        print(f"error: 今の lock が、{JOURNAL_REL} の前の lock とも新しい lock とも違う。記録を信用できないので何も変えない。"
+              "配布先と lock を手で確かめる", file=sys.stderr)
+        return 2
+    try:
+        done = _recover_plan_and_apply(repo, j, ops, lp, cur_lock, cur_sha)
+    except RecoverStop as e:
+        print(f"error: {e}。配布先・lock・.prev は何も変えていない。記録({JOURNAL_REL})と一時領域は残した。手で確かめる",
+              file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"error: recover できなかった({type(e).__name__}: {e})。記録({JOURNAL_REL})と一時領域は残した。"
+              "原因を取り除いてからもう一度 recover する", file=sys.stderr)
+        return 2
+    shutil.rmtree(j["work"], ignore_errors=True)
+    journal.unlink()
+    _cleanup_tmp(repo)
+    print(f"recover: {done}")
+    return 0
+
+
+def target_state(repo: Path, lock: dict, name: str, target: str) -> str:
+    """absent / managed(lock どおり)/ edited(配った後に手で変更)/ foreign(lock に無い本人のもの)/ unsafe"""
+    try:
+        dst = child_dir(repo / TARGET_DIRS[target], name, repo)
+    except PathError:
+        return "unsafe"
+    prev = lock["skills"].get(name, {}).get("targets", {}).get(target)
+    if not dst.exists():
+        return "absent"
+    if prev is None:
+        return "foreign"
+    return "managed" if (sha_tree(dst) == prev and not has_links(dst)) else "edited"
+
+
+def precheck_targets(repo: Path, lock: dict, pairs: list[tuple[str, str]]) -> list[str]:
+    errs = []
+    for n, t in pairs:
+        stt = target_state(repo, lock, n, t)
+        dst = (TARGET_DIRS[t] / n).as_posix()
+        if stt == "unsafe":
+            errs.append(f"{dst}: 名前かパスが管理の範囲の外を指す(.. ・/ ・シンボリックリンク)。触らない")
+        elif stt == "foreign":
+            errs.append(f"{dst} は lock に無い(本人のスキル?)ので上書きしない")
+        elif stt == "edited":
+            errs.append(f"{dst} は配った後に手で変更されている。上書きしない(先に正本へ反映)")
+    return errs
+
+
+def journal_left(repo: Path) -> list[str]:
+    if (repo / JOURNAL_REL).exists():
+        return [f"前回の配布が途中で止まった記録がある({JOURNAL_REL})。先に `skillsync recover {repo}` で戻す"]
+    return []
+
+
+def report(errs: list[str]) -> int:
+    for e in errs:
+        print(f"error: {e}", file=sys.stderr)
+    print("何も変更していない", file=sys.stderr)
+    return 2
+
+
+# 再配布できると分かるライセンス(LICENSE の1行目か UPSTREAM.json の license)。前後を固定して照合する
+REDISTRIBUTABLE = [re.compile(p, re.I) for p in (
+    r"^(the )?mit license$", r"^mit$", r"^apache license,? version 2\.0$", r"^apache license$", r"^apache-2\.0$",
+    r"^bsd [23]-clause( \"?(new|simplified|revised)\"?)? license$", r"^bsd-[23]-clause$", r"^isc license$", r"^isc$",
+    r"^the unlicense$", r"^unlicense$", r"^cc0 1\.0 universal$", r"^cc0-1\.0$", r"^cc-by-4\.0$",
+    r"^creative commons attribution 4\.0 international( public license)?$", r"^mozilla public license,? version 2\.0$",
+    r"^mpl-2\.0$", r"^zlib license$", r"^unicode license v3$", r"^unicode-3\.0$")]
+
+
+def redistributable(name: str) -> bool:
+    n = re.sub(r"\s+", " ", (name or "").strip().strip("#").strip())
+    return any(p.match(n) for p in REDISTRIBUTABLE)
+
+
+def bundle_json(root: Path, name: str) -> dict:
+    p = root / name
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def resolve_names(bundle_root: Path, skills: str, sets: str) -> tuple[list[str], list[str]]:
+    """--skills と --set(正本の sets.json)から配るスキル名を決める"""
+    names = [s for s in skills.split(",") if s]
+    errs = []
+    defined = bundle_json(bundle_root, "sets.json").get("sets", {})
+    for n in list(names) + [x for v in defined.values() if isinstance(v, list) for x in v]:
+        try:
+            check_name(n)
+        except PathError as e:
+            errs.append(str(e))
+    for st in [x for x in sets.split(",") if x]:
+        if st not in defined:
+            errs.append(f"正本の sets.json にセット {st} が無い")
+            continue
+        names += [n for n in defined[st] if n not in names]
+    return names, errs
+
+
+def detect_license(skill: Path) -> dict:
+    """スキルのライセンスと来歴(LICENSE* / UPSTREAM.json)。分からなければ unknown。"""
+    info = {"name": "unknown", "file": "", "upstream": ""}
+    for f in sorted(skill.glob("LICENSE*")) + sorted(skill.glob("COPYING*")):
+        if f.is_file():
+            first = next((l.strip() for l in f.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()), "")
+            info.update(name=first[:80] or "unknown", file=f.name)
+            break
+    up = skill / "UPSTREAM.json"
+    if up.is_file():
+        try:
+            j = json.loads(up.read_text(encoding="utf-8"))
+            info["upstream"] = str(j.get("repo") or j.get("source") or j.get("url") or "")[:200]
+            if info["name"] == "unknown" and j.get("license"):
+                info["name"] = str(j["license"])[:80]
+        except json.JSONDecodeError:
+            pass
+    return info
+
+
+def target_visibility(repo: Path) -> str:
+    """public / private / unknown。SKILLSYNC_TARGET_VISIBILITY で上書き(テスト・オフライン用)"""
+    v = os.environ.get("SKILLSYNC_TARGET_VISIBILITY")
+    if v:
+        return v
+    url = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip()
+    m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+    if not m or not shutil.which("gh"):
+        return "unknown"
+    r = subprocess.run(["gh", "api", f"repos/{m.group(1)}", "--jq", ".private"], capture_output=True, text=True, timeout=30)
+    return {"true": "private", "false": "public"}.get(r.stdout.strip(), "unknown")
+
+
+def visibility_errors(repo: Path, allow_public: bool, licenses: dict) -> list[str]:
+    """公開リポジトリへ配ると、正本が非公開でもスキルは公開される。ライセンスで再配布できると分かるものだけ認める。"""
+    vis = target_visibility(repo)
+    if vis == "private":
+        return []
+    if not allow_public:
+        if vis == "unknown":
+            return ["配布先が公開か非公開か確かめられない(gh が無い・GitHub 以外等)。非公開なら SKILLSYNC_TARGET_VISIBILITY=private、"
+                    "公開かもしれないなら --public-target(再配布できるものだけ配る)"]
+        return ["配布先は公開リポジトリ。配ったスキルは公開される。分かったうえでなら --public-target を付ける"]
+    return [f"{n}: ライセンスが再配布可能と確かめられない({l['name']})。公開されうるリポジトリには配らない"
+            for n, l in licenses.items() if not redistributable(l["name"])]
+
+
+def full_tree(d: Path) -> str:
+    """ディレクトリの全ファイル(__pycache__・node_modules 等も含め、何も飛ばさない)のハッシュ。copied_tree と同じ計算で、
+    シンボリックリンクがあれば必ず違う値になる(copy_skill はリンクを写さない)"""
+    items = []
+    for dp, dns, fns in os.walk(d, onerror=_walk_error):
+        for x in dns + fns:
+            q = Path(dp) / x
+            if q.is_symlink():
+                items.append((q, b"L" + os.readlink(q).encode()))
+            elif not q.is_dir():
+                items.append((q, None))
+    h = hashlib.sha256()
+    for q, link in sorted(items, key=lambda t: t[0]):
+        h.update(q.relative_to(d).as_posix().encode() + b"\0")
+        h.update(link if link is not None else hashlib.sha256(q.read_bytes()).digest())
+    return h.hexdigest()
+
+
+def run_smoke(d: Path, cmds: list[str]) -> list[str]:
+    """正本の checks.json に書いた(本人が確認した)代表処理だけを実行する。d は信頼できる正本から写した一時の写し"""
+    errs = []
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    for c in cmds:
+        try:
+            r = subprocess.run(c, shell=True, cwd=d, capture_output=True, text=True, timeout=120, env=env)
+        except subprocess.TimeoutExpired:
+            errs.append(f"代表処理が時間切れ: {c}")
+            continue
+        if r.returncode != 0:
+            errs.append(f"代表処理が失敗({r.returncode}): {c}: {(r.stderr or r.stdout).strip().splitlines()[-1:]}")
+    return errs
+
+
+def cmd_vendor(a) -> int:
+    repo = Path(a.repo).resolve()
+    targets = [t for t in a.targets.split(",") if t]
+    bad_t = [t for t in targets if t not in TARGET_DIRS]
+    if bad_t or not targets:
+        return report([f"--targets は {', '.join(TARGET_DIRS)} のどれか(指定: {a.targets})"])
+    if journal_left(repo):
+        return report(journal_left(repo))
+    try:
+        skills_dir, commit, tmp = checkout_bundle(a.bundle, a.ref)
+    except subprocess.CalledProcessError as e:
+        return report([f"正本を取得できない: {a.bundle} @ {a.ref or 'HEAD'}: {(e.stderr or '').strip()[:200]}"])
+    dep = Deploy(repo)
+    try:
+        lock = load_lock(repo)
+        names, errs = resolve_names(skills_dir.parent, a.skills, a.set)
+        if not names and not errs:
+            errs.append("--skills か --set で配るスキルを指定する")
+        checks = bundle_json(skills_dir.parent, "checks.json")
+        errs += visibility_errors(repo, a.public_target, {n: detect_license(skills_dir / n) for n in names
+                                                          if (skills_dir / n).is_dir()})
+        infos = {}
+        for n in names:
+            try:
+                src = child_dir(skills_dir, n)
+            except PathError as e:
+                errs.append(str(e))
+                continue
+            if not (src / "SKILL.md").is_file():
+                errs.append(f"正本に {n}/SKILL.md が無い")
+                continue
+            infos[n] = analyze(src)
+            if infos[n]["class"] == "blocked":
+                errs.append(f"{n} は blocked({infos[n]['reason']})。秘密らしいものを含むので配らない(--force でも)")
+            elif infos[n]["class"] == "mac-only" and not a.force:
+                errs.append(f"{n} は mac-only({infos[n]['reason']})。--force で配れるが推奨しない")
+        errs += precheck_targets(repo, lock, [(n, t) for n in names for t in targets])
+        if errs:
+            return report(errs)
+        new_lock = json.loads(json.dumps(lock))
+        for n in names:
+            hashes = {}
+            for t in targets:
+                print(f"{'[dry-run] ' if a.dry_run else ''}vendor {n} → {(TARGET_DIRS[t] / n).as_posix()} @ {commit[:12]}")
+                hashes[t] = dep.stage(n, t, skills_dir / n)
+            prev_targets = lock["skills"].get(n, {}).get("targets", {})
+            known = sorted(e for e in check_skill_dir(skills_dir / n) if e.startswith("参照ファイルが無い"))
+            new_lock["skills"][n] = {"bundle": bundle_location(a.bundle), "bundle_id": a.bundle_id or "", "known_missing": known,
+                                     "commit": commit, "sha256": sha_tree(skills_dir / n),
+                                     "class": infos[n]["class"], "license": detect_license(skills_dir / n),
+                                     "smoke": checks.get(n, []), "targets": {**prev_targets, **hashes}}
+        new_lock["updated_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        if a.dry_run:
+            dep.abort()
+            return 0
+        dep.commit(new_lock)
+    except DeployError as e:
+        if not (repo / JOURNAL_REL).exists():
+            dep.abort()
+        return report_deploy(e, repo)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return 0
+
+
+def check_skill_dir(d: Path) -> list[str]:
+    errs = []
+    sm = d / "SKILL.md"
+    if not sm.is_file():
+        return ["SKILL.md が無い"]
+    t = sm.read_text(encoding="utf-8", errors="replace")
+    fm = frontmatter(t)
+    if not (fm.get("name") and fm.get("description")):
+        errs.append("frontmatter の name / description が無い")
+    for m in REL_LINK.finditer(t):
+        ref = m.group(1).rstrip(".,")
+        if not (d / ref).exists():
+            errs.append(f"参照ファイルが無い: {ref}")
+    for p in iter_files(d):
+        r = None
+        if p.suffix == ".py":
+            # -I: 今のディレクトリ(配布先)や環境変数のパスからモジュールを読まない(置かれた py_compile.py を動かさない)
+            r = subprocess.run([sys.executable, "-I", "-c", "import sys;compile(open(sys.argv[1],'rb').read(),sys.argv[1],'exec')", str(p)], capture_output=True, text=True,
+                               cwd=tempfile.gettempdir())
+        elif p.suffix == ".sh":
+            r = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True, cwd=tempfile.gettempdir())
+        elif p.suffix in (".js", ".cjs", ".mjs") and shutil.which("node"):
+            r = subprocess.run(["node", "--check", str(p)], capture_output=True, text=True, cwd=tempfile.gettempdir())
+        if r is not None and r.returncode != 0:
+            errs.append(f"構文エラー: {p.relative_to(d)}: {(r.stderr or r.stdout).strip().splitlines()[-1:]}")
+        if is_text(p) and ABS_PATH.search(p.read_text(encoding="utf-8", errors="replace")):
+            errs.append(f"絶対パスが残っている: {p.relative_to(d)}")
+    return errs
+
+
+def smoke_from_bundle(ent: dict, name: str, cache: dict, tmps: list, trusted: str) -> tuple[list[str] | None, str]:
+    """lock に写した代表処理が、正本(lock の commit)の checks.json と同じかを確かめる。
+    lock は配布先のリポジトリ(PR で変えられる)にあるので、正本の場所も lock から取らない:
+    実行する人がコマンドで指定した正本(--bundle)だけを使い、lock の記録がそれと同じときだけ実行する。"""
+    if not trusted:
+        return None, "代表処理を実行するには、正本の場所を --bundle で指定する(lock に書かれた場所は使わない)"
+    if not re.fullmatch(r"[0-9a-f]{40}", str(ent.get("commit", ""))):
+        return None, "lock の commit が 40 桁の SHA でない(実行しない)"
+    if bundle_location(trusted) != ent.get("bundle", ""):
+        return None, f"lock の正本の場所({ent.get('bundle')})が --bundle と違う(実行しない)"
+    key = (trusted, ent["commit"])
+    if key not in cache:
+        try:
+            skills_dir, _, tmp = checkout_bundle(*key)
+            tmps.append(tmp)
+            cache[key] = bundle_json(skills_dir.parent, "checks.json")
+            cache[("dir",) + key] = skills_dir
+        except (subprocess.CalledProcessError, OSError) as e:
+            cache[key] = None
+            return None, f"正本 {key[0]} @ {key[1][:12]} を取得できない(代表処理は実行しない): {str(e)[:120]}"
+    checks = cache[key]
+    if checks is None:
+        return None, "正本を取得できない(代表処理は実行しない)"
+    want = checks.get(name, [])
+    if want != ent.get("smoke", []):
+        return None, "lock の代表処理が正本の checks.json と違う(実行しない。lock が書き換えられた可能性)"
+    return want, str(cache[("dir",) + key] / name)
+
+
+def cmd_verify(a) -> int:
+    repo = Path(a.repo).resolve()
+    lock = load_lock(repo)
+    bad = 0
+    cache: dict = {}
+    tmps: list = []
+    try:
+        for n, ent in sorted(lock["skills"].items()):
+            try:
+                check_name(n)
+            except PathError as e:
+                print(f"NG  {n!r}: lock の名前が不正: {e}"); bad += 1; continue
+            for t, h in ent.get("targets", {}).items():
+                if t not in TARGET_DIRS:
+                    print(f"NG  {n} [{t!r}]: lock の配布先が不正"); bad += 1; continue
+                try:
+                    d = child_dir(repo / TARGET_DIRS[t], n, repo)
+                except PathError as e:
+                    print(f"NG  {n} [{t}]: {e}"); bad += 1; continue
+                if not d.exists():
+                    print(f"NG  {n} [{t}]: 見つからない"); bad += 1; continue
+                if sha_tree(d) != h:
+                    print(f"NG  {n} [{t}]: lock と内容が違う(手で変更された?)"); bad += 1
+                    continue
+                if has_links(d):
+                    print(f"NG  {n} [{t}]: 配った写しにシンボリックリンクがある({', '.join(has_links(d)[:3])})"); bad += 1
+                    continue                     # 中身が lock と違うものは、代表処理も実行しない
+                errs = [e for e in check_skill_dir(d) if not (e.startswith("参照ファイルが無い") and e in ent.get("known_missing", []))]
+                ran = ""
+                if getattr(a, "run", False) and ent.get("smoke"):
+                    cmds, why = smoke_from_bundle(ent, n, cache, tmps, getattr(a, "bundle", "") or "")
+                    if cmds is None:
+                        errs.append(why)
+                    else:
+                        bsrc = Path(why)
+                        # 配った写しが、正本(--bundle の lock の commit)から写したものとファイル1つまで同じか
+                        # (lock のハッシュは配布先で書き換えられる。__pycache__ 等の飛ばすディレクトリも含めて比べる)
+                        if not (bsrc / "SKILL.md").is_file() or full_tree(d) != copied_tree(bsrc):
+                            errs.append("配った写しが正本の中身と違う(ファイルの追加・変更。代表処理は実行しない)")
+                        else:
+                            run_dir = Path(tempfile.mkdtemp(prefix="skillsync-smoke-")) / n
+                            tmps.append(str(run_dir.parent))
+                            copy_skill(bsrc, run_dir)          # 実行は、正本から新しく写した一時の写しで
+                            (run_dir / ".skillsync.json").unlink(missing_ok=True)
+                            errs += run_smoke(run_dir, cmds)
+                            ran = f"、代表処理 {len(cmds)} 件"
+                warn_only = errs and all(e.startswith("絶対パス") for e in errs) and ent.get("class") != "cloud-ok"
+                for e in errs:
+                    print(f"{'WARN' if warn_only else 'NG '} {n} [{t}]: {e}")
+                if errs and not warn_only:
+                    bad += 1
+                if errs and warn_only and ran:
+                    print(f"OK  {n} [{t}] @ {ent['commit'][:12]}{ran}(注意あり)")
+                if not errs:
+                    print(f"OK  {n} [{t}] @ {ent['commit'][:12]}{ran}")
+    finally:
+        for tmp in tmps:
+            shutil.rmtree(tmp, ignore_errors=True)
+    print(f"verify: {'OK' if bad == 0 else f'{bad} 件の問題'}")
+    return 0 if bad == 0 else 1
+
+
+def fetch_all(entries: dict, override: str | None = None) -> tuple[dict, list[str], list[str]]:
+    """lock の各スキルの正本を、全部取り出して内容ハッシュを確かめる。戻り値: (名前→スキルの置き場, 一時dir, 問題)"""
+    srcs, tmps, errs, cache = {}, [], [], {}
+    for n, ent in entries.items():
+        key = (override or ent["bundle"], ent["commit"])
+        try:
+            if key not in cache:
+                skills_dir, _, tmp = checkout_bundle(key[0], ent["commit"])
+                cache[key] = skills_dir
+                tmps.append(tmp)
+        except subprocess.CalledProcessError as e:
+            errs.append(f"{n}: 正本 {ent['bundle']} @ {ent['commit'][:12]} を取得できない: {(e.stderr or '').strip()[:160]}")
+            continue
+        try:
+            src = child_dir(cache[key], n)
+        except PathError as e:
+            errs.append(f"{n}: {e}")
+            continue
+        if not (src / "SKILL.md").is_file():
+            errs.append(f"{n}: 正本 @ {ent['commit'][:12]} に無い")
+        elif sha_tree(src) != ent.get("sha256"):
+            errs.append(f"{n}: 正本 @ {ent['commit'][:12]} の内容が lock のハッシュと違う")
+        else:
+            srcs[n] = src
+    return srcs, tmps, errs
+
+
+def cmd_rollback(a) -> int:
+    repo = Path(a.repo).resolve()
+    prev_p = (repo / LOCK_REL).with_suffix(".prev.json")
+    if journal_left(repo):
+        return report(journal_left(repo))
+    if not prev_p.exists():
+        print("戻せる直前の lock が無い(git の履歴から lock を戻して vendor し直す)", file=sys.stderr)
+        return 2
+    prev = json.loads(prev_p.read_text(encoding="utf-8"))
+    cur = load_lock(repo)
+    bad = [n for n in list(prev["skills"]) + list(cur["skills"]) if not SKILL_NAME.match(n) or set(n) <= {"."}]
+    if bad:
+        return report([f"lock のスキル名が不正(範囲の外を指しうる): {bad}"])
+    cur_pairs = [(n, t) for n, ent in cur["skills"].items() for t in ent.get("targets", {})]
+    errs = [e.replace("上書きしない", "戻さない") for e in precheck_targets(repo, cur, cur_pairs)]
+    for n, ent in prev["skills"].items():          # 今は lock に無いが、戻すと置く場所に本人のものがある
+        for t in ent.get("targets", {}):
+            if (n, t) not in cur_pairs and (repo / TARGET_DIRS[t] / n).exists():
+                errs.append(f"{(TARGET_DIRS[t] / n).as_posix()} に lock に無いスキルがあるので戻さない")
+    # .prev は配布先のリポジトリにあり書き換えられる。正本の場所は .prev から取らず、--bundle で指定したものだけを使う
+    if not a.bundle:
+        return report(["rollback は戻す元の正本を --bundle で指定する(.prev に書かれた場所は信用しない)"])
+    for n, ent in prev["skills"].items():      # 取り出すのは --bundle の正本からだけ(.prev の場所は使わない)
+        bad_t = [t for t in ent.get("targets", {}) if t not in TARGET_DIRS]
+        if bad_t:
+            errs.append(f"{n}: .prev の配布先が不正({bad_t})。戻さない")
+        if not re.fullmatch(r"[0-9a-f]{40}", str(ent.get("commit", ""))):
+            errs.append(f"{n}: .prev の commit が 40 桁の SHA でない。戻さない")
+    if errs:
+        return report(errs)
+    srcs, tmps, fetch_errs = fetch_all(prev["skills"], a.bundle)     # 復元元を全部取得・検証してから触る
+    errs += fetch_errs
+    for n, src in srcs.items():          # 戻す内容も vendor と同じ検査にかける
+        info = analyze(src)
+        if info["class"] == "blocked":
+            errs.append(f"{n}: 戻す内容が blocked(秘密らしいもの)。戻さない")
+        elif info["class"] == "mac-only" and not getattr(a, "force", False):
+            errs.append(f"{n}: 戻す内容が mac-only({info['reason']})。--force が無ければ戻さない")
+    errs += visibility_errors(repo, getattr(a, "public_target", False), {n: detect_license(src) for n, src in srcs.items()})
+    dep = Deploy(repo)
+    try:
+        if errs:
+            return report(errs)
+        for n, ent in prev["skills"].items():
+            for t in ent.get("targets", {}):
+                h = dep.stage(n, t, srcs[n])
+                if h != ent["targets"][t]:
+                    raise DeployError(f"{n} [{t}]: 復元した内容が当時の配布と違う")
+        for n, t in cur_pairs:
+            if t not in prev["skills"].get(n, {}).get("targets", {}):
+                dep.remove(n, t)
+        dep.commit(prev)
+        write_json_atomic(prev_p, cur)        # もう一度 rollback すると今の状態に戻れる
+    except DeployError as e:
+        if not (repo / JOURNAL_REL).exists():
+            dep.abort()
+        return report_deploy(e, repo)
+    finally:
+        for t in tmps:
+            shutil.rmtree(t, ignore_errors=True)
+    print("rollback: 直前の lock の状態に戻した(もう一度 rollback すると戻す前に戻る)")
+    return 0
+
+
+def cmd_remove(a) -> int:
+    repo = Path(a.repo).resolve()
+    if journal_left(repo):
+        return report(journal_left(repo))
+    lock = load_lock(repo)
+    new_lock = json.loads(json.dumps(lock))
+    dep = Deploy(repo)
+    kept = []
+    for n in [s for s in a.skills.split(",") if s]:
+        try:
+            check_name(n)
+        except PathError as e:
+            return report([str(e)])
+        ent = lock["skills"].get(n)
+        if not ent:
+            print(f"skip: {n} は lock に無い(このツールで配ったものではない)")
+            continue
+        states = {t: target_state(repo, lock, n, t) for t in ent.get("targets", {})}
+        if any(v == "edited" for v in states.values()):
+            kept.append(n)
+            print(f"keep: {n} は配布先のどれかが手で変更されているので、全部残す({states})")
+            continue
+        for t, v in states.items():
+            if v == "managed":
+                dep.remove(n, t)
+                print(f"remove: {(TARGET_DIRS[t] / n).as_posix()}")
+        del new_lock["skills"][n]
+    try:
+        dep.commit(new_lock)
+    except DeployError as e:
+        if not (repo / JOURNAL_REL).exists():
+            dep.abort()
+        return report_deploy(e, repo)
+    return 1 if kept else 0
+
+
+CLAUDE_AI_KEYS = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
+
+
+def cmd_zip(a) -> int:
+    """claude.ai へ手動で上げる zip。export と同じ検査(秘密・サイズ・Mac 専用・参照・構文)を必ず通す。
+    検査に通らなければ zip を作らない。途中で失敗しても、できかけの zip を残さない。"""
+    src = Path(a.skill).expanduser().resolve()
+    try:
+        check_name(src.name)
+    except PathError as e:
+        return report([str(e)])
+    info = analyze(src)
+    errs = []
+    if info["class"] in ("blocked", "skip"):
+        errs.append(f"{info['reason']}(秘密らしいファイル: {info['secret_files'] or '-'}、秘密らしい文字列: {info['secret_text'] or '-'}、"
+                    f"大きいファイル: {info['large'] or '-'})")
+    elif info["class"] == "mac-only" and not a.force:
+        errs.append(f"{info['reason']}(--force で作れるが、クラウドでは動かない)")
+    errs += [e for e in check_skill_dir(src) if not e.startswith("絶対パス")]
+    fm = frontmatter((src / "SKILL.md").read_text(encoding="utf-8", errors="replace")) if (src / "SKILL.md").exists() else {}
+    extra = set(fm) - CLAUDE_AI_KEYS
+    if extra:
+        errs.append(f"claude.ai へのアップロードでは使えない frontmatter: {sorted(extra)}")
+    if len(fm.get("description", "")) > 200:
+        print("注意: description が200文字を超える(claude.ai のヘルプ記事の上限)", file=sys.stderr)
+    out = Path(a.out).expanduser().resolve()
+    if out == src or src in out.parents:
+        errs.append("zip の出力先がスキルのディレクトリの中にある(自分自身を梱包してしまう)。外を指定する")
+    if errs:
+        for e in errs:
+            print(f"error: {e}", file=sys.stderr)
+        print("zip は作っていない", file=sys.stderr)
+        return 2
+    tmp = out.with_name(out.name + f".tmp-{os.getpid()}")
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+            for p in sorted(iter_files(src)):
+                if p.is_symlink() or p.name == ".skillsync.json":
+                    continue
+                z.write(p, f"{src.name}/{p.relative_to(src).as_posix()}")
+        os.replace(tmp, out)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    print(f"zip: {out}(検査済み: {info['class']}、{info['files']} ファイル)")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    p = sp.add_parser("inventory"); p.add_argument("dirs", nargs="+"); p.add_argument("--json"); p.add_argument("--md")
+    p.add_argument("--include-hidden", action="store_true"); p.set_defaults(fn=cmd_inventory)
+    p = sp.add_parser("export"); p.add_argument("src"); p.add_argument("bundle"); p.add_argument("--name")
+    p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_export)
+    p = sp.add_parser("vendor"); p.add_argument("bundle"); p.add_argument("repo"); p.add_argument("--skills", default="")
+    p.add_argument("--set", default="", help="正本の sets.json のセット名(カンマ区切り)。--skills と足し合わせる")
+    p.add_argument("--ref"); p.add_argument("--targets", default="codex,claude"); p.add_argument("--bundle-id")
+    p.add_argument("--public-target", action="store_true",
+                   help="公開リポジトリへ配ることを認める(ライセンスで再配布できると分かるスキルだけ配る)")
+    p.add_argument("--dry-run", action="store_true"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_vendor)
+    p = sp.add_parser("verify"); p.add_argument("repo")
+    p.add_argument("--bundle", help="--run の代表処理を照合する正本(lock に書かれた場所は信用しない)")
+    p.add_argument("--run", action="store_true", help="正本の checks.json に書いた代表処理(確認済みのコマンドだけ)も実行する")
+    p.set_defaults(fn=cmd_verify)
+    p = sp.add_parser("rollback"); p.add_argument("repo")
+    p.add_argument("--bundle", help="戻す元の正本(必須。.prev に書かれた場所は使わない。内容ハッシュも確かめる)")
+    p.add_argument("--force", action="store_true", help="Mac 専用の判定のスキルも戻す(blocked は戻さない)")
+    p.add_argument("--public-target", action="store_true")
+    p.set_defaults(fn=cmd_rollback)
+    p = sp.add_parser("remove"); p.add_argument("repo"); p.add_argument("--skills", required=True); p.set_defaults(fn=cmd_remove)
+    p = sp.add_parser("recover"); p.add_argument("repo"); p.set_defaults(fn=cmd_recover)
+    p = sp.add_parser("zip"); p.add_argument("skill"); p.add_argument("out"); p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_zip)
+    a = ap.parse_args()
+    if a.cmd in ("vendor", "rollback", "remove", "recover"):
+        repo = Path(a.repo).resolve()
+        try:
+            check_kit_dir(repo)
+            for t in TARGET_DIRS.values():       # .claude・.agents 等がリンクなら最初から扱わない
+                cur = repo
+                for part in t.parts:
+                    cur = cur / part
+                    if cur.is_symlink():
+                        raise PathError(f"{cur} がシンボリックリンク(配布先が範囲の外を指しうる)")
+        except PathError as e:
+            return report([str(e)])
+        fn = lambda: with_repo_lock(repo, lambda: a.fn(a))   # noqa: E731
+    else:
+        fn = lambda: a.fn(a)                                 # noqa: E731
+    try:
+        return fn()
+    except OSError as e:
+        # 読めないディレクトリ・ファイル等。一部だけ読んで進めない(配布の途中なら journal が残り、recover で戻せる)
+        return report([f"読めない・書けない: {e.filename or ''}: {e.strerror or e}(何も確定していない。journal が残っていれば recover)"])
+
+
+def with_repo_lock(repo: Path, fn) -> int:
+    """同じ配布先への vendor / rollback / remove / recover を同時に走らせない(後から来た方は何もせず止まる)"""
+    import fcntl
+    gd = subprocess.run(["git", "-C", str(repo), "rev-parse", "--absolute-git-dir"], capture_output=True, text=True).stdout.strip()
+    lf = Path(gd) / "skillsync.lock" if gd else repo / ".agent-kit" / "skillsync.lock"   # .git の中なら commit されない
+    lf.parent.mkdir(parents=True, exist_ok=True)
+    if lf.is_symlink():
+        return report([f"{lf} がシンボリックリンク(範囲の外にファイルを作りうる)"])
+    fd = os.open(lf, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(fd, "a+") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return report(["同じ配布先で skillsync が実行中。終わってからやり直す"])
+        try:
+            return fn()
+        except Exception as e:
+            if (repo / JOURNAL_REL).exists():     # 途中で止まった記録があれば、退避した内容を消さない
+                print(f"error: 予期しない失敗: {type(e).__name__}: {e}", file=sys.stderr)
+                print(f"配布が途中で止まった。`skillsync recover {repo}` を実行する(一時領域は残した)", file=sys.stderr)
+                return 2
+            for d in (repo / ".agent-kit" / "tmp").glob(f"skillsync-{os.getpid()}-*"):
+                shutil.rmtree(d, ignore_errors=True)
+            _cleanup_tmp(repo)
+            return report([f"予期しない失敗: {type(e).__name__}: {e}"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

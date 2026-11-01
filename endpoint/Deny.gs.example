@@ -1,0 +1,8 @@
+/**
+ * Deny.gs(任意・個人ごと)— Code.gs と同じ Apps Script プロジェクトに置く。
+ * ここに書いたフォルダとその配下には、Script Properties の設定に関係なく書き込まない。
+ * 同期ミラー(Obsidian の Vault の写しなど)のフォルダ ID を書く。公開リポジトリには実際の ID を入れない。
+ */
+var PERSONAL_DENY = [
+  // 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',  // 例: ミラーのルート
+];
