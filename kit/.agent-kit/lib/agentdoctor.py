@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
+import sys
 
 CORE_TOOLS = ("bash", "git", "python3", "gh")
 PROJECT_TOOLS = {
@@ -69,8 +71,23 @@ def config_values(text: str) -> dict[str, str]:
     return values
 
 
-def inspect(root: Path, which=shutil.which, environ=None) -> list[str]:
-    """Return fixed labels only; do not execute tools or create state."""
+def gh_api_support(executable: str, run=subprocess.run) -> bool | None:
+    """Read local help only: no endpoint, credentials, prompts or update checks."""
+    env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "TZ") if k in os.environ}
+    env.update(GH_NO_UPDATE_NOTIFIER="1", GH_NO_EXTENSION_UPDATE_NOTIFIER="1",
+               GH_PROMPT_DISABLED="1", NO_COLOR="1", CLICOLOR="0")
+    try:
+        result = run([executable, "api", "--help"], capture_output=True, text=True,
+                     encoding="utf-8", errors="replace", timeout=5, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    return re.search(r"(?m)^\s+--slurp(?:\s|$)", result.stdout) is not None
+
+
+def inspect(root: Path, which=shutil.which, environ=None, probe_gh=False, gh_check=gh_api_support) -> list[str]:
+    """Never create state; execute gh help only when explicitly requested."""
     environ = os.environ if environ is None else environ
     problems = []
     failed = object()
@@ -88,9 +105,19 @@ def inspect(root: Path, which=shutil.which, environ=None) -> list[str]:
     for marker, tool in PROJECT_TOOLS.items():
         if (root / marker).exists():
             tools.add(tool)
-    for tool in sorted(tools):
-        if which(tool) is None:
+    found = {tool: which(tool) for tool in sorted(tools)}
+    for tool, executable in found.items():
+        if executable is None:
             problems.append("missing: tool " + tool)
+    if found.get("gh") is not None:
+        if not probe_gh:
+            problems.append("unverified: gh api --slurp support (opt in with --probe-gh)")
+        else:
+            supported = gh_check(found["gh"])
+            if supported is False:
+                problems.append("unsupported: gh api --slurp (gh 2.48+ required)")
+            elif supported is None:
+                problems.append("unverified: gh api --slurp support")
 
     cfg = check(".agent-kit/config.env", config_values)
     if cfg is not failed:
@@ -115,7 +142,14 @@ def inspect(root: Path, which=shutil.which, environ=None) -> list[str]:
             targets = manifest["targets"]
     for rel in (".agent-kit/VERSION", ".agent-kit/lib/common.sh", ".agent-kit/bin/setup-deps.sh",
                 ".agent-kit/bin/agent-log", ".agent-kit/bin/agent-gh", ".agent-kit/bin/agent-publish"):
-        check(rel)
+        path = check(rel)
+        if path is not failed and rel in (".agent-kit/bin/agent-gh", ".agent-kit/bin/agent-log"):
+            try:
+                executable = bool(path.stat().st_mode & 0o111) and os.access(path, os.X_OK)
+            except OSError:
+                executable = False
+            if not executable:
+                problems.append("not executable: " + rel)
     for target in targets:
         directory, doc = (".agents", "AGENTS.md") if target == "codex" else (".claude", "CLAUDE.md")
         check(doc)
@@ -129,18 +163,22 @@ def inspect(root: Path, which=shutil.which, environ=None) -> list[str]:
 
 
 def main() -> int:
+    args = sys.argv[1:]
+    if args not in ([], ["--probe-gh"]):
+        print("usage: setup-deps.sh {check|doctor} [--probe-gh]")
+        return 2
     try:
         selected = os.environ.get("AGENT_REPO_ROOT")
         project = os.environ.get("CLAUDE_PROJECT_DIR")
         if not selected and project and (Path(project) / ".agent-kit").is_dir():
             selected = project
         root = Path(selected or Path(__file__).resolve().parents[2]).resolve(strict=True)
-        problems = inspect(root) if root.is_dir() else ["invalid: target directory"]
+        problems = inspect(root, probe_gh=bool(args)) if root.is_dir() else ["invalid: target directory"]
     except (OSError, RuntimeError, ValueError):
         problems = ["invalid: target directory"]
     for problem in problems:
         print(problem)
-    print(f"doctor: {'issues found' if problems else 'ok'}; offline/read-only; versions, credentials and services not checked")
+    print(f"doctor: {'attention required' if problems else 'ok'}; offline/read-only; versions, credentials and services not checked")
     return 1 if problems else 0
 
 

@@ -6,6 +6,7 @@
 #   setup-deps.sh all      deps + extras
 #   setup-deps.sh check    必要な CLI と導入済み設定の形式を読み取り専用で点検
 #   setup-deps.sh doctor   check と同じ(値・絶対パスを表示せず、状態も作らない)
+#   setup-deps.sh doctor --probe-gh   明示したときだけ gh のローカルヘルプで --slurp を確認
 #   setup-deps.sh plan     必要な CLI・接続先・サービスの一覧(導入前の確認用。何も入れない)
 #
 # 方針:
@@ -23,10 +24,12 @@ SELF_DIR="$(cd -- "$SELF_PARENT" 2>/dev/null && pwd)" || { echo 'invalid: setup 
 # Read-only diagnostics must run before config loading or state/lock creation.
 case "${1:-}" in
   check|doctor)
-    [ "$#" -eq 1 ] || { echo 'usage: setup-deps.sh {check|doctor}' >&2; exit 2; }
+    if [ "$#" -ne 1 ] && ! { [ "$#" -eq 2 ] && [ "$2" = --probe-gh ]; }; then
+      echo 'usage: setup-deps.sh {check|doctor} [--probe-gh]' >&2; exit 2
+    fi
     command -v python3 >/dev/null 2>&1 || { echo 'missing: tool python3'; exit 1; }
     [ -f "$SELF_DIR/../lib/agentdoctor.py" ] || { echo 'invalid: doctor installation'; exit 1; }
-    exec python3 -B "$SELF_DIR/../lib/agentdoctor.py"
+    exec python3 -B "$SELF_DIR/../lib/agentdoctor.py" "${@:2}"
     ;;
 esac
 # shellcheck source=../lib/common.sh

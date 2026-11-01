@@ -43,7 +43,8 @@ Mac で(キットを展開した場所を `$KIT` とする):
 cd <対象リポジトリ> && git switch -c feature/0-agent-kit
 python3 $KIT/install.py . --dry-run --github-templates     # 何が変わるか確認
 python3 $KIT/install.py . --github-templates --profile <個人設定の env>   # 作者のメール等(個人設定は公開版に含めない)
-bash .agent-kit/bin/setup-deps.sh check && bash .agent-kit/bin/setup-deps.sh plan
+bash .agent-kit/bin/setup-deps.sh check                  # 未検証も注意(終了1)として返す
+bash .agent-kit/bin/setup-deps.sh plan
 # 必須 CI がルールセット等で決まっていなければ: .agent-kit/ci-policy.json を作る(docs/09)
 git add .agent-kit .claude .agents AGENTS.md CLAUDE.md .github
 git commit -m "Add agent-kit for cloud agents" && git push -u origin feature/0-agent-kit
@@ -56,10 +57,16 @@ PR を作り、本人がマージする(これ自体もキットの流れの最�
 
 導入後は `bash .agent-kit/bin/setup-deps.sh doctor` (`check` も同じ)で、基本 CLI、検出した言語に必要な CLI、
 設定ファイルの形式と導入先の構成を点検する。足りないもの・不正なものは固定のツール名と相対ファイル名だけで表示し、
-設定値・絶対パスは表示しない。外部 API や各 CLI を実行せず、設定・依存・ロック・キャッシュ・状態ディレクトリも作らない。
+設定値・絶対パスは表示しない。既定では点検対象のCLIを起動せず、Issue連携に必要な `gh api --slurp` の互換性は未検証として注意を返す。
+設定・依存・ロック・キャッシュ・状態ディレクトリは作らない。
+直接実行する `agent-gh`・`agent-log` は実行権限も点検する。`python3` や `bash` 経由のファイルには実行ビットを要求しない。
 
-終了コードは、検出した問題が無ければ0、不足・不正があれば1、余分な引数があれば2。自動修復は行わない。
-ツールの版、認証、サービスへの接続、Geminiへの送信承認はこの点検の対象外。`gh` の2.48以上という前提などは別途確認する。
+`bash .agent-kit/bin/setup-deps.sh doctor --probe-gh` を明示した場合だけ、PATH上の `gh api --help` をローカルで実行して `--slurp` を確認する。
+この実行を許可するCLIか先に確認する。更新通知・対話は無効、認証情報やAPIの宛先は渡さず、ヘルプの生出力も表示しない。
+外部APIや他のCLIコマンドは呼ばない。
+
+終了コードは、点検できた範囲で問題・未検証が無ければ0、不足・不正・未検証があれば1、余分な引数があれば2。自動修復は行わない。
+`--slurp` 未対応やヘルプ取得失敗・タイムアウトも不合格として伝える。CLIの正確な版、認証、サービスへの接続、Geminiへの送信承認は対象外。
 回帰テストは `python3 -B tests/test_doctor.py`。
 
 ## 3. スキルの配布(必要なものを選んだ後)
