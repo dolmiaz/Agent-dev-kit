@@ -101,7 +101,7 @@
 - 本人による確認(任意): 本人がレビューのセッションを開いてモデル(画面の表示)と、実装と別のセッションであることを確かめたら、
   **本人の端末で**、本人の SSH 鍵で署名して記録する:
   `agent-gh human-confirm <PR> --sha <SHA> --items model,session --key <鍵> --principal <名前>`
-  (`--key` は秘密鍵か、ssh-agent・1Password の SSH エージェントに入っている鍵の公開鍵ファイル。署名は `ssh-keygen -Y sign`)。
+  (`--key` は秘密鍵か、ssh-agent・1Password の SSH エージェントに入っている鍵の公開鍵ファイル。署名は `ssh-keygen -Y sign`。OpenSSH 8.0 以上の `ssh-keygen -Y sign/verify` が必要)。
   merge-gate は、**ベースブランチ**の `.agent-kit/human-confirm-allowed-signers`(公開鍵だけ。`<名前> namespaces="agent-kit-human-confirm" <公開鍵>`)
   で署名を確かめたものだけを使う。ファイルが無ければ本人確認は使わない。秘密鍵はクラウドに持ち込まない
   (クラウドのエージェントは本人の GitHub の権限でコメントできるので、投稿者では本人を区別できないため署名にした)。

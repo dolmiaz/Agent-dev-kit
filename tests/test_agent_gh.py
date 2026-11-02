@@ -10,6 +10,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -17,12 +18,17 @@ import time
 import traceback
 from pathlib import Path
 
+
+class Skip(Exception):
+    """Mark a test as SKIP when an optional tool (e.g. ssh-keygen) is missing."""
+
 KIT = Path(__file__).resolve().parents[1]
 W = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path("/tmp/agentgh-test")
 W.mkdir(parents=True, exist_ok=True)
 R = W / "repo"
 STATE = W / "gh.json"
-RESULTS: list[tuple[bool, str, str]] = []
+# ok: True=PASS, False=FAIL, None=SKIP
+RESULTS: list[tuple[bool | None, str, str]] = []
 CODEX_EMAIL = "codex-cloud@example.com"
 
 BASE_ENV = {k: v for k, v in os.environ.items()
@@ -148,6 +154,8 @@ def test(name):
             try:
                 fn()
                 RESULTS.append((True, name, ""))
+            except Skip as e:
+                RESULTS.append((None, name, str(e) or "skipped"))
             except AssertionError as e:
                 RESULTS.append((False, name, str(e) or traceback.format_exc(limit=1).strip().splitlines()[-1]))
             except Exception:
@@ -159,6 +167,14 @@ def test(name):
 
 
 TESTS = []
+
+
+def require_ssh_keygen():
+    if shutil.which("ssh-keygen"):
+        return
+    if os.environ.get("CI"):
+        raise AssertionError("CI では ssh-keygen が必要")
+    raise Skip("ssh-keygen が無い")
 
 
 def claim_state(n=1):
@@ -453,6 +469,7 @@ def t_review_push_no_refspec():
 
 
 def make_signer():
+    require_ssh_keygen()
     key = W / "human_key"
     if not key.exists():
         sh("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "human", "-f", str(key))
@@ -462,6 +479,7 @@ def make_signer():
 
 @test("review: 実装側のセッションが分からなければ独立性は未確認 → 不合格。署名つきの本人確認で合格")
 def t_review_human_confirm():
+    require_ssh_keygen()
     head = make_pr(with_marker=False, commit_emails=["someone@example.com"])
     green_ci(head)
     rc, out = review(Session("rev-1", remote_id="cse_rev"), head)
@@ -781,10 +799,37 @@ def t_review_freetext_session():
 
 @test("human-confirm: PR の今の HEAD の 40 桁の SHA でなければ署名しない")
 def t_human_confirm_sha():
+    require_ssh_keygen()
     head = make_pr()
     key, _ = make_signer()
     rc, out = Session("human", hooks=False).run(f"human-confirm 102 --sha HEAD --items model --key {key} --principal human@example.com", model=None)
     assert rc == 2 and "40 桁" in out, out
+
+
+@test("human-confirm: ssh-keygen が無いとき verify_result が道具なしの理由を返す")
+def t_verify_missing_ssh_keygen():
+    sys.path.insert(0, str(KIT / "kit/.agent-kit/lib"))
+    from agentgh import humanconfirm as humanconfirm
+
+    real_which = shutil.which
+
+    def fake_which(cmd, *a, **k):
+        if cmd == "ssh-keygen":
+            return None
+        return real_which(cmd, *a, **k)
+
+    shutil.which = fake_which  # type: ignore[assignment]
+    try:
+        assert humanconfirm.available() is False
+        ok, reason = humanconfirm.verify_result("signers", "p", b"data", "sig")
+        assert ok is False and reason == humanconfirm.MISSING_TOOL, (ok, reason)
+        try:
+            humanconfirm.sign("key", b"data")
+            raise AssertionError("sign should raise when ssh-keygen is missing")
+        except RuntimeError as e:
+            assert "OpenSSH" in str(e), e
+    finally:
+        shutil.which = real_which  # type: ignore[assignment]
 
 
 @test("gate: マージ先が既定のブランチでなければ注記する")
@@ -1170,8 +1215,13 @@ def main():
         t()
     fails = 0
     for ok, name, why in RESULTS:
-        print(("PASS " if ok else "FAIL ") + name + ("" if ok else f": {why}"))
-        fails += 0 if ok else 1
+        if ok is None:
+            print("SKIP " + name + (f": {why}" if why else ""))
+        elif ok:
+            print("PASS " + name)
+        else:
+            print("FAIL " + name + f": {why}")
+            fails += 1
     return 1 if fails else 0
 
 

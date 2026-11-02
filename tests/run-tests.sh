@@ -7,9 +7,10 @@
 set -u
 KITROOT="$(cd "$(dirname "$0")/.." && pwd)"
 W="$(mktemp -d "${TMPDIR:-/tmp}/agentkit-test.XXXXXX")"
-PASS=0; FAIL=0; RESULTS=()
+PASS=0; FAIL=0; SKIP=0; RESULTS=()
 ok() { PASS=$((PASS+1)); RESULTS+=("PASS [$SEC] $*"); echo "  PASS $*"; }
 ng() { FAIL=$((FAIL+1)); RESULTS+=("FAIL [$SEC] $*"); echo "  FAIL $*"; }
+sk() { SKIP=$((SKIP+1)); RESULTS+=("SKIP [$SEC] $*"); echo "  SKIP $*"; }
 expect() { local name="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else ng "$name"; fi; }
 section() { SEC="$1"; echo; echo "== $* =="; }
 SEC=0
@@ -347,15 +348,20 @@ expect "codex author set" test "$(git -C "$R" config --local user.name)" = "Code
 
 # ---------------------------------------------------------------------------
 section 7 "agent-gh: Issue 単位の担当確保・レビューの SHA 固定・モデルと独立性の確認・必須 CI・マージ可否"
-# 詳細は tests/test_agent_gh.py(偽の gh・偽の transcript・本物の hook)。1行ずつ PASS/FAIL を数える
+# 詳細は tests/test_agent_gh.py(偽の gh・偽の transcript・本物の hook)。1行ずつ PASS/FAIL/SKIP を数える
 python3 "$KITROOT/tests/test_agent_gh.py" "$W/agentgh" > "$W/agentgh.out" 2>&1
 while IFS= read -r line; do
   case "$line" in
     "PASS "*) ok "${line#PASS }" ;;
     "FAIL "*) ng "${line#FAIL }" ;;
+    "SKIP "*) sk "${line#SKIP }" ;;
   esac
 done < "$W/agentgh.out"
-expect "agent-gh tests produced results" grep -q '^PASS ' "$W/agentgh.out"
+expect "agent-gh tests produced results" grep -qE '^(PASS|SKIP) ' "$W/agentgh.out"
+# CI では ssh-keygen あり前提。SKIP が出たら失敗(飛ばさない)
+if [ -n "${CI:-}" ] && grep -q '^SKIP ' "$W/agentgh.out"; then
+  ng "agent-gh must not skip under CI (ssh-keygen required)"
+fi
 
 # ---------------------------------------------------------------------------
 section 8 "Mac 回収(repo モードを選んだ場合): サービス別フォルダ・ID+内容照合・台帳"
@@ -1066,6 +1072,6 @@ if command -v shellcheck >/dev/null 2>&1; then
 fi
 
 echo
-echo "== 結果: PASS $PASS / FAIL $FAIL (作業ディレクトリ $W) =="
+echo "== 結果: PASS $PASS / FAIL $FAIL / SKIP $SKIP (作業ディレクトリ $W) =="
 printf '%s\n' "${RESULTS[@]}" > "$W/results.txt"
 [ "$FAIL" = 0 ]
