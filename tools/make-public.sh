@@ -9,7 +9,7 @@ OUT="${1:?出力先のディレクトリを指定する}"
 [ ! -e "$OUT" ] || [ -z "$(ls -A "$OUT" 2>/dev/null)" ] || { echo "出力先が空でない: $OUT" >&2; exit 2; }
 mkdir -p "$OUT"
 
-INCLUDE=(README.md PUBLISH.md SECURITY.md LICENSE LICENSE-NOTICE.md .gitignore .env.sample .github install.py kit endpoint/Code.gs endpoint/appsscript.json endpoint/Deny.gs.example
+INCLUDE=(README.md README.ja.md PUBLISH.md SECURITY.md LICENSE LICENSE-NOTICE.md .gitignore .env.sample .github install.py kit endpoint/Code.gs endpoint/appsscript.json endpoint/Deny.gs.example
          local skills/skillsync.py skills/bundle-template tests tools
          docs/01-codex-cloud-settings.md docs/02-claude-code-web-settings.md docs/03-network-packages-permissions.md
          docs/04-identity-signing-secrets.md docs/05-worklog-to-obsidian.md docs/06-manual-setup.md

@@ -163,7 +163,7 @@ class PublicReleaseTests(unittest.TestCase):
             result = subprocess.run(["bash", str(ROOT / "tools/make-public.sh"), str(out)],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, "Public-copy validation failed; inspect locally.")
-            for name in (".gitignore", ".env.sample", "local/with-gemini-env.py", "docs/10-publish-polish.md", "SECURITY.md", "LICENSE", "LICENSE-NOTICE.md"):
+            for name in (".gitignore", ".env.sample", "README.md", "README.ja.md", "local/with-gemini-env.py", "docs/10-publish-polish.md", "SECURITY.md", "LICENSE", "LICENSE-NOTICE.md"):
                 self.assertTrue((out / name).is_file(), name)
             self.assertEqual((out / "LICENSE").read_bytes(), (ROOT / "LICENSE").read_bytes())
             for name in ("personal", "reports", ".git", ".env"):
