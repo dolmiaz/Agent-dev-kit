@@ -228,8 +228,13 @@ def human_confirms(repo: str, number: int, comments: list[dict], sha: str, bc: B
         return items, notes
     for m in marks:
         data = humanconfirm.payload(repo, number, sha, m.get("items") or [])
-        if humanconfirm.verify(signers or "", m.get("principal", ""), data, m.get("sig", "")):
+        ok, reason = humanconfirm.verify_result(
+            signers or "", m.get("principal", ""), data, m.get("sig", "")
+        )
+        if ok:
             items |= set(m.get("items") or [])
+        elif reason:
+            notes.append(reason)
         else:
             notes.append("署名を確かめられない本人確認の記録は使わない")
     return items, sorted(set(notes))
