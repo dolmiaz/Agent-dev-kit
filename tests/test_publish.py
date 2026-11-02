@@ -174,9 +174,11 @@ def t_minimal_data():
     for k in SECRET_ENV:
         assert k not in c["env"], f"{k} が渡っている"
     assert "MY_GEMINI_KEY" not in c["env"] and "GEMINI_API_KEY" in c["env"], c["env"]
+    # macOS's Python runtime may add this metadata after the filtered exec.
+    platform_env = {"__CF_USER_TEXT_ENCODING"} if sys.platform == "darwin" else set()
     assert set(c["env"]) <= {"PATH", "LANG", "LC_ALL", "TZ", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy",
                              "no_proxy", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "GEMINI_CLI_HOME", "HOME", "NO_COLOR",
-                             "GEMINI_TELEMETRY_ENABLED", "GEMINI_API_KEY", "PWD", "SHLVL", "_", "LC_CTYPE"}, c["env"]
+                             "GEMINI_TELEMETRY_ENABLED", "GEMINI_API_KEY", "PWD", "SHLVL", "_", "LC_CTYPE"} | platform_env, c["env"]
     assert "REPO-PRIVATE-MARKER-7f3a" not in c["stdin"], "リポジトリの中身が送られている"
     assert BODY.strip() in c["stdin"] and FACTS.strip() in c["stdin"]
     assert c["cwd_files"] == [] and str(R) not in c["cwd"], c["cwd"]

@@ -45,6 +45,45 @@ class PublicReleaseTests(unittest.TestCase):
     def test_examples_are_allowed(self):
         self.assertEqual(scanner.scan_text("sample", "bot@example.com", scanner.GENERIC), [])
 
+    def test_env_sample_requires_blank_assignments_and_still_scans_comments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / ".env.sample"
+            sample.write_text("# public template\nGEMINI_API_KEY=\n")
+            self.assertEqual(scanner.scan_tree(root, scanner.GENERIC, set()), [])
+            for text in ("GEMINI_API_KEY=synthetic-not-real\n", "GEMINI_API_KEY=\"\"\n",
+                         "export GEMINI_API_KEY=\n", "# comments only\n"):
+                sample.write_text(text)
+                hits = scanner.scan_tree(root, scanner.GENERIC, set())
+                self.assertTrue(hits)
+                self.assertNotIn("synthetic-not-real", "\n".join(hits))
+            sample.write_text("# " + "ghp_" + "A" * 30 + "\nGEMINI_API_KEY=\n")
+            self.assertTrue(scanner.scan_tree(root, scanner.GENERIC, set()))
+            sample.write_text("GEMINI_API_KEY=\n")
+            (root / ".env").write_text("not inspected")
+            (root / ".env.production").write_text("not inspected")
+            hits = scanner.scan_tree(root, scanner.GENERIC, set())
+            self.assertEqual(len(hits), 2)
+
+    def test_sample_history_rejects_deleted_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git = self.make_repo(root)
+            sample = root / ".env.sample"
+            sample.write_text("GEMINI_API_KEY=\n")
+            git("add", ".env.sample")
+            git("commit", "-m", "Blank sample")
+            self.assertEqual(scanner.scan_history(root, scanner.GENERIC), [])
+            sample.write_text("GEMINI_API_KEY=synthetic-not-real\n")
+            git("add", ".env.sample")
+            git("commit", "-m", "Synthetic populated sample")
+            sample.write_text("GEMINI_API_KEY=\n")
+            git("add", ".env.sample")
+            git("commit", "-m", "Blank sample again")
+            hits = scanner.scan_history(root, scanner.GENERIC)
+            self.assertTrue(hits)
+            self.assertNotIn("synthetic-not-real", "\n".join(hits))
+
     def make_repo(self, root):
         def git(*args):
             return subprocess.run(["git", "-C", str(root), *args], check=True,
@@ -124,10 +163,10 @@ class PublicReleaseTests(unittest.TestCase):
             result = subprocess.run(["bash", str(ROOT / "tools/make-public.sh"), str(out)],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, "Public-copy validation failed; inspect locally.")
-            for name in (".gitignore", "docs/10-publish-polish.md", "SECURITY.md", "LICENSE", "LICENSE-NOTICE.md"):
+            for name in (".gitignore", ".env.sample", "local/with-gemini-env.py", "docs/10-publish-polish.md", "SECURITY.md", "LICENSE", "LICENSE-NOTICE.md"):
                 self.assertTrue((out / name).is_file(), name)
             self.assertEqual((out / "LICENSE").read_bytes(), (ROOT / "LICENSE").read_bytes())
-            for name in ("personal", "reports", ".git"):
+            for name in ("personal", "reports", ".git", ".env"):
                 self.assertFalse((out / name).exists(), name)
 
 

@@ -1,113 +1,157 @@
-# agent-dev-kit — Codex Cloud / Claude Code on the web 用のセットアップ一式
+# Agent-dev-kit
 
-外出中でも承認待ちや環境構築の不備で止まりにくくするためのキット。
-依存はロックファイルから自動で入れ、通常の開発操作は止めず、公開・マージ・デプロイ・削除・新しい認証情報だけを止める。
-作業ログはターンごとに Markdown で残し、書き込み専用の受け口経由で Drive(ChatGPT / Claude フォルダ)へ届ける。
-Issue → 実装 → 別セッションのレビュー → マージ可否の技術判定までを、二重着手せずに回す道具も含む。
+Codex Cloud と Claude Code on the web に、依存の準備、作業ログ、Issue の確保、PR のレビュー、公開前の文章推敲を導入するキットです。
+共通の処理を `.agent-kit/` にまとめ、各サービスのセットアップと hooks から呼び出します。
 
-対象: **新しい Codex Cloud 環境** と **Claude Code on the web**(Codex Legacy・ローカル CLI・Remote Control は対象外)。確認日 2026-10-29。
+対象は新しい Codex Cloud 環境と Claude Code on the web です。Codex Legacy、ローカル CLI、Remote Control 向けの環境構築は対象外です。
+このリポジトリの `local/` には、Mac での設定補助とログ回収の道具があります。
 
-公開版の検証方法は下記の「検証」を参照。元の個人設定・検証ログ・Git 履歴は含めない。
+## キットを導入する
 
-## 中身
-
-```
-agent-dev-kit/
-├── README.md / install.py(導入・更新・取り外し。manifest に記録したものだけ外す)
-├── kit/.agent-kit/                       対象リポジトリへ入る中身
-│   ├── VERSION, config.env               設定(秘密なし。環境変数 > config.env > 既定値)
-│   ├── lib/common.sh                     共通: 実行環境・設定の読み込み・チェックアウトごとの状態・timeout・再試行・ロック・指紋
-│   ├── lib/agentstate.py                 共通: 状態置き場、hook が残すセッションの証拠、transcript の読み取り
-│   ├── lib/agentgh/                      agent-gh の本体(api / issues / claims / review / gate)
-│   ├── bin/setup-deps.sh                 共通: 依存の判定と導入(deps / extras / all / check / plan)
-│   ├── bin/agent-log                     共通: 作業ログ(UUID・秘密の除去・送信・ID+内容照合・outbox)
-│   ├── bin/agent-gh                      共通: Issue 単位の確保・PR・SHA を固定したレビュー記録・必須 CI を含むマージ可否(マージはしない)
-│   ├── bin/skillsync                     共通: 個人スキルの棚卸し・正本への取り込み・セット単位の配布・検証・ロールバック・recover
-│   ├── bin/git-identity.sh, services.sh  共通: 作者名、PostgreSQL / Redis
-│   ├── codex/setup.sh                    Codex: Install script から呼ぶ
-│   ├── claude/environment-setup.sh       Claude: 環境の Setup script に貼る(OS ライブラリだけ)
-│   ├── claude/session-start.sh, turn-start.sh, stop.sh, pretool.py   Claude: hooks(クラウドでだけ動く)
-│   ├── claude/settings.fragment.json     Claude: .claude/settings.json に足す hooks(許可ルールは足さない)
-│   ├── claude/cloud-permissions.json     Claude: クラウドだけの allow / ask / deny
-│   ├── skills/cloud-worklog, issue-task, pr-review   両サービス共通のスキル
-│   ├── snippets/AGENTS.md, CLAUDE.md     指示ファイルに入れる区間(各サービスで動いているときだけ適用)
-│   └── github/ISSUE_TEMPLATE/agent-task.yml, pull_request_template.md
-├── endpoint/Code.gs, appsscript.json     Drive への書き込み専用の受け口(Apps Script、無料)
-├── endpoint/Deny.gs.example              書き込まないフォルダ ID をコードに固定する個人用ファイルの例
-├── skills/skillsync.py                   skillsync の入口(本体は kit/.agent-kit/bin/skillsync)
-├── skills/bundle-template/               スキルの正本の雛形(sets.json・checks.json)
-├── tools/publish-check.py, make-public.sh 公開前の点検・公開用の写しの作成(個人の値・履歴を持ち込まない)
-├── local/new-log-key.sh                  Mac: 送信キーを作る(値を画面に出さない)
-├── local/collect-pending.py              Mac: repo モードを選んだ場合の回収(ID 固定・ID+内容照合)
-├── tests/                                回帰テスト(本物の Code.gs をモックで実行、fake gh / rclone)
-└── docs/
-    ├── 01-codex-cloud-settings.md        Codex Cloud の設定一覧と推奨構成
-    ├── 02-claude-code-web-settings.md    Claude Code on the web の設定一覧と推奨構成
-    ├── 03-network-packages-permissions.md パッケージ・接続先・権限(最初にまとめて決める)
-    ├── 04-identity-signing-secrets.md    作者名・認証・署名・秘密(署名必須の採否を含む)
-    ├── 05-worklog-to-obsidian.md         ログの経路・形式・一意性・上限・Obsidian への取り込み
-    ├── 06-manual-setup.md                適用手順(対象リポジトリと実環境)・手動設定・ロールバック
-    ├── 08-skills-distribution.md         個人スキルの棚卸しと配布(セット・途中失敗への強さ・ライセンス)
-    ├── 09-issue-to-merge-workflow.md     Issue → 実装 → レビュー → マージ可否の分担
-    └── sources.md                        出典
-```
-
-## 共通部分とサービス固有部分
-
-| | 共通 | Codex Cloud | Claude Code on the web |
-|---|---|---|---|
-| 依存 | setup-deps.sh | Install script → `codex/setup.sh` | 環境の Setup script(OS ライブラリ)+ SessionStart hook |
-| 毎ターンの記録 | agent-log、skill cloud-worklog | hooks が無い前提 → AGENTS.md と skill | Stop hook が記録漏れを1回促し、送信も行う |
-| 権限 | — | 承認の設定が無い → AGENTS.md + GitHub の保護 | PreToolUse hook がクラウドでだけ判定(ローカルは無変化)+ GitHub の保護 |
-| 秘密 | 作業ログの除去 | network secrets / Personal vault | network secrets |
-| Issue・レビュー | agent-gh、skills issue-task / pr-review | 確保は依頼側(dot / 本人) | REST で確保・PR・記録 |
-
-## 使い方(概要)
+Python 3 と Git を用意し、まず導入先に加わる変更を確認します。
 
 ```bash
 python3 install.py <repo> --dry-run --github-templates
-python3 install.py <repo> --github-templates          # --only codex / --only claude も可
-python3 install.py <repo> --profile <個人設定の env>   # 作者のメール等を個人の値に(個人設定は公開版に入れない)
-python3 install.py <repo> --uninstall                 # キットが入れたものだけ外す
-bash tests/run-tests.sh                                # 回帰テスト(NO_NET=1 でネットワークなし)
-bash tools/make-public.sh <出力先>                    # 公開用の写し(点検に通ったときだけ。履歴は持ち込まない)
+python3 install.py <repo> --github-templates
 ```
-手順の全体は [docs/06-manual-setup.md](docs/06-manual-setup.md)。
 
-## 設計上の約束
-
-- プラットフォームの制限(許可リスト・プロキシ・シークレットの段階)をシェルから迂回しない。
-- ロックファイルを書き換えない。ロックが無い言語は導入を飛ばして警告する。
-- セットアップやログの失敗で作業全体を止めない(既定)。止めたいときは `AGENT_SETUP_STRICT=1` / `AGENT_LOG_STRICT=1`。
-- 未送信ログは既定で Git に入れない(`AGENT_LOG_PENDING_MODE=repo` を明示したときだけ)。
-- クラウド向けの許可をローカルの Claude に適用しない(設定ファイルに許可ルールを書かず、hook がクラウドでだけ判定する)。
-- 人間用の 1Password 鍵・YubiKey はクラウドに持ち込まない。クラウドではコミット署名しない。
-- ツールはマージしない。マージ可否の技術判定と、正式な承認・マージの実行者・権限は分ける。
-- モデル・独立したセッション・必須 CI・mergeable は、確かめられなければ「未確認」で、合格にしない(確認できたふりをしない)。
-- 個人の値(メール・Drive のフォルダ ID・個人のパス・非公開リポジトリの名前)は personal/ に置き、汎用のコードと分ける。
-- リポジトリ固有の指示(「main へ変更しない」「マージしない」等)はキットの区間より優先する。
-- 存在しない設定や終了フックを作らない(Claude の SessionEnd、Codex の hooks は使わない)。
-
-## 検証
-
-Python 3、Bash、Git、Node.js が必要。外部サービスを呼ばないモック中心の検証は以下で実行する。
+`--only codex` / `--only claude` で対象を選べます。作者のメールなどは、公開しない個人設定を `--profile <個人設定の env>` で渡します。
+`--profile` の値は導入先の `.agent-kit/config.env`（通常は追跡対象）に入るため、API キーなどの秘密を含めないでください。
+更新と取り外しは manifest に記録した範囲で行い、既存の設定や手で変更したファイルを扱う際は確認結果を表示します。
+手動設定と切り戻しは [導入手順](docs/06-manual-setup.md) を参照してください。
 
 ```bash
+python3 install.py <repo> --uninstall
+```
+
+導入後は、[Codex Cloud](docs/01-codex-cloud-settings.md) または [Claude Code on the web](docs/02-claude-code-web-settings.md) の環境設定を行います。
+ネットワークの許可先やパッケージの準備は [ネットワークと依存](docs/03-network-packages-permissions.md) にまとめています。
+ログ送信には本人の送信先と認証の設定が必要で、自動的に第三者の送信先へ接続する初期値はありません。
+
+## ローカルの Gemini API キーを用意する
+
+Gemini CLI の導入と認証方式の選択は利用者が行います。このキットは CLI のインストール、ログイン、API キーの発行、課金設定を行いません。
+CLI の [公式導入手順](https://geminicli.com/docs/get-started/installation/) と [認証手順](https://geminicli.com/docs/get-started/authentication/) を確認し、利用する版の設定と挙動を確かめてください。
+
+このリポジトリで API キー方式を使う場合は、追跡対象の `.env.sample` を雛形にします。雛形は値を空のまま保ちます。
+`.env` がすでにあれば、その内容を維持してください。新規作成時だけ、次の手順で上書きせずに作れます。
+
+```bash
+(umask 077; set -C; cat .env.sample > .env)
+chmod 600 .env
+```
+
+本人がエディタで `.env` の `GEMINI_API_KEY=` の右にキーを貼り付けて保存します。
+`.env` は Git で除外し、権限は本人だけが読み書きできる `600` にします。読み取り専用の `400` もローカル用ランチャーで扱えます。
+キーを README、チャット、ログ、コミット、コマンド引数に書かないでください。
+
+```bash
+python3 local/with-gemini-env.py --check
+git check-ignore -v -- .env
+git ls-files -- .env
+```
+
+`--check` はキーの設定有無だけを表示します。値を表示せず、認証確認や API リクエストも行いません。
+最後のコマンドは何も出力しない状態が正しく、`.env.sample` は追跡対象です。
+
+**`agent-publish` は `.env` を自動では読み込みません。** ローカル用の `local/with-gemini-env.py` は、このチェックアウトの `.env` から
+`GEMINI_API_KEY` だけをデータとして読み、子プロセスの環境変数でキットへ渡します。シェルとして実行せず、他の変数やシェル展開、重複したキーは拒否します。
+通常の CLI が行う `.env` 探索には依存しません。キットの推敲実行は、空の作業ディレクトリと `ignoreLocalEnv` を使います。
+
+このファイルはローカル用です。クラウドでは各サービスの秘密の環境変数設定にキーを登録します。ローカルの `.env` をクラウドへ送らないでください。
+導入先のキットへ `.env` やローカル用ランチャーを自動配置する処理もありません。
+
+## Gemini に文章を推敲させる
+
+公開前の Gemini 推敲は必須ゲートです。PR のタイトル・本文、リリースノート、README などが対象です。
+キーを置くだけでは送信しません。本人が入力の扱い、料金、利用可能な枠、モデル、CLI 版を確認し、送信を承認してから使います。
+無料枠の有無はキーやプロジェクトによって異なるため、[公式料金表](https://ai.google.dev/gemini-api/docs/pricing) だけで本人の残量や課金を判断しないでください。
+
+必要な設定は次のとおりです。本人の本当のホームにある `~/.config/agent-kit/publish.env`、またはクラウドの環境変数で指定します。
+API キーの値をこの設定ファイルへ書く方式ではありません。
+
+| 設定名 | 本人が確認して指定する内容 |
+| --- | --- |
+| `AGENT_GEMINI_SEND_APPROVED` | 入力の扱いと費用を確認し、送信を承認した場合だけ `1` |
+| `AGENT_GEMINI_AUTH` | API キー方式では `api-key` |
+| `AGENT_GEMINI_KEY_ENV` | `GEMINI_API_KEY`。ローカル用ランチャーもこの名前を使う |
+| `AGENT_GEMINI_MODEL` | 利用可能な具体的なモデル名。`auto`・`pro`・`flash` などの別名は使わない |
+| `AGENT_GEMINI_CLI_VERSION` | 設定と挙動を確認した CLI の版。実行時の版と一致すること |
+| `AGENT_GEMINI_HOME` | 普段の設定と分けた推敲専用の設定置き場 |
+
+ランチャーは送信承認、モデル、CLI 版を自動設定しません。`AGENT_POLISH_REQUIRED=1` の既定値も維持します。
+設定の優先順位、認証方式、送信内容、保留の条件は [公開前の推敲](docs/10-publish-polish.md) を参照してください。
+
+このソースリポジトリで README の推敲を実行する入口は次です。送信する文書には公開してよい内容だけを残してください。
+コマンドは設定が整うと Gemini へリクエストするため、料金・送信の承認後に実行します。
+
+```bash
+python3 local/with-gemini-env.py polish --kind readme --file README.md --path README.md
+```
+
+導入先では `python3 .agent-kit/bin/agent-publish polish ...` を使い、キーはプロセスの環境変数で渡します。
+返された記録 ID の差分を作成側が読み、数値、機能、試験結果、否定の意味が変わっていないことを確認してから確定します。
+
+```bash
+python3 local/with-gemini-env.py confirm <ID> --reviewed-diff
+python3 local/with-gemini-env.py apply <ID>
+```
+
+未設定、認証切れ、上限、版の不一致、別モデルの応答などで推敲が保留になったら、管理対象の公開を止めます。下書きと実装は続けられます。
+推敲は技術レビューや本人の承認、マージ判断の代わりにはなりません。公開には確認済みの記録を用いる既存の `agent-publish` 手順を使います。
+
+## 構成と各機能の手順
+
+| 場所 | 内容 |
+| --- | --- |
+| `kit/.agent-kit/` | 導入先へ配置する共通処理、設定、セットアップ、hooks、スキル |
+| `install.py` | 導入・更新・取り外しと manifest の管理 |
+| `endpoint/` | Drive への書き込み専用の Apps Script 受け口 |
+| `local/` | Mac のログ回収、送信キーの準備、ローカルの Gemini キー読み込み |
+| `skills/` | 個人スキルの棚卸しと配布の入口、配布セットの雛形 |
+| `tests/` | 外部サービスをモックに置き換えた回帰試験 |
+| `tools/` | 公開用の写しの作成と秘密・個人情報の検査 |
+
+- [作者・署名・秘密の管理](docs/04-identity-signing-secrets.md)
+- [作業ログから Obsidian まで](docs/05-worklog-to-obsidian.md)
+- [スキルの配布](docs/08-skills-distribution.md)
+- [Issue からマージ可否の判定まで](docs/09-issue-to-merge-workflow.md)
+- [出典](docs/sources.md)
+
+## 検証する
+
+Python 3、Bash、Git、Node.js を使います。シェル回帰試験は GNU 系のコマンドがある Linux 環境を前提にしています。
+モック試験は一時的なローカル HTTP サーバーを使います。制限環境では追加の許可が必要な場合があります。
+
+```bash
+python3 tests/test_local_env.py
 NO_NET=1 bash tests/run-tests.sh
 python3 tests/test_agent_gh.py "$(mktemp -d)"
 python3 tests/test_publish.py "$(mktemp -d)"
 python3 tests/test_public_release.py
-python3 tools/publish-check.py . --history
 ```
 
-`NO_NET=1` は実際の依存ダウンロード試験を省く。本番の Codex Cloud、Claude Code on the web、GitHub、Drive、Gemini への接続確認の代わりにはならない。
-モック試験は一時的なローカル HTTP サーバーを使用する。制限環境ではその試験が失敗する場合がある。
+これらの試験は本物の API キーを読み込まず、本物の Gemini・GitHub・Drive へ接続しません。
+`NO_NET=1` は実際の依存ダウンロード試験を省きます。実サービスへの接続確認の代わりにはなりません。
 
-## 公開版の境界
+`.env` のある作業用チェックアウトをそのまま公開検査にかけると、除外対象として検出されます。
+公開用の写しには許可したファイルだけを含め、空の `.env.sample` も検査します。値の入った雛形は拒否します。
 
-- 配布版は 2.3.0 を基礎とする。内部ディレクトリ名 `.agent-kit` と設定キーは互換性のため変更しない。
-- 個人設定、送信キー、Drive フォルダ ID、既存 Git 履歴、個人スキルの実体は含まない。
-- 作業ログ送信は利用者が送信先と認証を設定してから使う。自動的に第三者の送信先へ接続する初期値はない。
-- Gemini 推敲は元設計どおり公開前のゲート。送信同意・認証・モデル・CLI 版が未設定なら送信せず公開を保留する。詳細は [docs/10](docs/10-publish-polish.md)。
-- このプロジェクトのコードと文書は [MIT License](LICENSE)。第三者素材の権利とテスト用のライセンス表記については [LICENSE-NOTICE.md](LICENSE-NOTICE.md) を参照。
-- 秘密情報検査の限界と事故時の対応は [SECURITY.md](SECURITY.md) を参照。
+```bash
+bash tools/make-public.sh <存在しないか空の出力先>
+python3 tools/publish-check.py <公開用の写し>
+```
+
+Git の履歴を公開する場合は `python3 tools/publish-check.py <repo> --history` も必要です。
+検査で見つからなかったことは、安全性の証明ではありません。[秘密情報検査の範囲](SECURITY.md) と [権利表記](LICENSE-NOTICE.md) を確認してください。
+
+## 運用上の約束
+
+- プラットフォームのプロキシや許可リストを迂回せず、秘密の値を表示・記録・コミットしません。
+- ロックファイルを変更せず、依存の導入とログ送信の失敗は既定では作業全体を止めません。
+- クラウド用の許可設定をローカルの Claude へ適用しません。人間用の 1Password 鍵や YubiKey はクラウドへ持ち込みません。
+- ツールはマージしません。モデル、独立したレビュー、必須 CI、マージ可否を確認できなければ未確認として扱います。
+- リポジトリ固有の制限がキットの一般的な指示より優先します。
+
+配布版は 2.3.0 を基礎とし、互換性のため内部名 `.agent-kit` と設定キーを維持しています。
+個人設定、認証情報、個人のスキルの実体は配布対象に含めません。コードと文書は [MIT License](LICENSE) です。

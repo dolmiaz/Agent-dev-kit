@@ -8,6 +8,7 @@
   Apps Script の公開 URL、秘密鍵・トークンの形
 - --extra のファイル(正規表現を1行1つ。例: personal/publish-deny.local.txt)に書いた個人の文字列
 - 公開しないファイル: personal/、reports/、*.log、.agent-logs/、.env 系、skills.lock*.json
+  (ルートの .env.sample は、コメントと値が空の代入だけなら通常の文字列検査も行って許可)
 - 入っていてはいけないディレクトリ: 入れ子の .git、node_modules、.venv、__pycache__
 - 中身を点検できないファイル(NUL を含む)は、--allow-binary に書いたもの以外を一覧に出す
 - 個人の文字列は大文字・小文字を区別せずに探す
@@ -37,6 +38,25 @@ GENERIC = [
 ]
 EXCLUDE_PATHS = re.compile(r"(^|/)(personal|reports|\.agent-logs)(/|$)|\.log$|(^|/)\.env(\.|$)|(^|/)\.envrc$|skills\.lock(\.prev)?\.json$")
 FLAG_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__"}   # 公開用の写しに入っていてはいけない
+
+
+def empty_env_sample(rel: str, data: bytes) -> bool:
+    """Only the root .env.sample with blank assignments is distributable."""
+    if rel != ".env.sample":
+        return False
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeError:
+        return False
+    assignments = 0
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*=", line):
+            return False
+        assignments += 1
+    return assignments > 0
 
 
 def load_extra(path: str | None) -> list[tuple[str, re.Pattern]]:
@@ -78,7 +98,8 @@ def scan_tree(root: Path, rules, allow_binary: set[str]) -> list[str]:
         if p.is_symlink():
             hits.append(f"{rel}: シンボリックリンク(リンク先は非表示)。公開用の写しには実体だけを入れる")
             continue
-        if EXCLUDE_PATHS.search(rel):
+        sample = rel == ".env.sample" and p.is_file() and empty_env_sample(rel, p.read_bytes())
+        if EXCLUDE_PATHS.search(rel) and not sample:
             parent_flagged = any(h.split(": ", 1)[0].endswith("/") and rel.startswith(h.split(": ", 1)[0]) for h in hits)
             if not parent_flagged:
                 hits.append(f"{rel}{'/' if p.is_dir() else ''}: 公開しないファイル・ディレクトリ")
@@ -114,13 +135,15 @@ def scan_history(root: Path, rules) -> list[str]:
             files = git("ls-tree", "-r", "--name-only", "-z", rev).decode().split("\0")
             for f in filter(None, files):
                 blob = git("rev-parse", f"{rev}:{f}").decode().strip()
-                if EXCLUDE_PATHS.search(f):
+                sample_data = git("cat-file", "-p", blob) if f == ".env.sample" else None
+                sample = sample_data is not None and empty_env_sample(f, sample_data)
+                if EXCLUDE_PATHS.search(f) and not sample:
                     hits.append(f"history {rev[:8]}:{f}: 公開しないファイル")
                     continue
                 if blob in seen:
                     continue
                 seen.add(blob)
-                data = git("cat-file", "-p", blob)
+                data = sample_data if sample_data is not None else git("cat-file", "-p", blob)
                 # Binary history cannot be certified by a text-only scan. Fail
                 # closed even if the file was deleted from the current tree.
                 if b"\0" in data:
