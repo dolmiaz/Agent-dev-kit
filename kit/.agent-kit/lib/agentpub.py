@@ -368,10 +368,11 @@ def run_gemini(cfg: dict, kind: str, draft: str, facts: str) -> tuple[str, dict]
             v = subprocess.run([exe, "--version"], cwd=work, env=env, capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise Hold("missing", f"Gemini CLI の版を確かめられない({type(e).__name__})")
+        reject_auth_echo(cfg, v.stdout, v.stderr)
         version = (v.stdout or "").strip().splitlines()[-1:] or [""]
         version = version[0].strip()
         if version != cfg["AGENT_GEMINI_CLI_VERSION"].strip():
-            raise Hold("version", f"Gemini CLI の版が {version or '不明'}(確かめた版は {cfg['AGENT_GEMINI_CLI_VERSION']})。"
+            raise Hold("version", "Gemini CLI の版が一致しない、または確認できない。"
                                   "新しい版の設定と挙動を確かめてから AGENT_GEMINI_CLI_VERSION を更新する")
         policy = Path(pol) / "deny-all.toml"
         policy.write_text(POLICY_DENY_ALL, encoding="utf-8")
@@ -385,7 +386,8 @@ def run_gemini(cfg: dict, kind: str, draft: str, facts: str) -> tuple[str, dict]
         except subprocess.TimeoutExpired:
             raise Hold("timeout", f"Gemini が {cfg['AGENT_GEMINI_TIMEOUT']} 秒で終わらない")
         except OSError as e:
-            raise Hold("missing", f"Gemini CLI を起動できない({e})")
+            raise Hold("missing", f"Gemini CLI を起動できない({type(e).__name__})")
+    reject_auth_echo(cfg, r.stdout, r.stderr)
     info = {"cli_version": version, "model_requested": cfg["AGENT_GEMINI_MODEL"], "auth": cfg["AGENT_GEMINI_AUTH"],
             "exit": r.returncode}
     data = _parse_json(r.stdout) or _parse_json(r.stderr) or {}
@@ -396,7 +398,7 @@ def run_gemini(cfg: dict, kind: str, draft: str, facts: str) -> tuple[str, dict]
     used = sorted((stats.get("models") or {}).keys())
     info["models_used"] = used
     if not used or any(m != cfg["AGENT_GEMINI_MODEL"] for m in used):
-        raise Hold("model", f"指定と違うモデルが応答した、または応答したモデルが分からない({used or '記録なし'})。"
+        raise Hold("model", "指定と違うモデルが応答した、または応答したモデルが分からない。"
                             "別のモデルの推敲稿は使わない")
     calls = ((stats.get("tools") or {}).get("totalCalls")) or 0
     if calls:
@@ -425,6 +427,14 @@ def _parse_json(s: str):
     return None
 
 
+def reject_auth_echo(cfg: dict, *outputs: str) -> None:
+    """Never retain CLI output that contains the actual API credential."""
+    if cfg["AGENT_GEMINI_AUTH"] == "api-key":
+        key = os.environ.get(cfg["AGENT_GEMINI_KEY_ENV"], "")
+        if key and any(key in (output or "") for output in outputs):
+            raise Hold("secret-output", "Gemini CLI の出力に認証情報が含まれたため破棄した。原文は表示・保存しない")
+
+
 def _classify(rc: int, err, stderr: str) -> Hold:
     msg = (err or {}).get("message", "") if isinstance(err, dict) else ""
     code = str((err or {}).get("code", "")) if isinstance(err, dict) else ""
@@ -434,8 +444,8 @@ def _classify(rc: int, err, stderr: str) -> Hold:
     if rc in (173,) or re.search(r"429|quota|RESOURCE_EXHAUSTED|rate limit|exhausted", text, re.I):
         return Hold("quota", f"Gemini の利用枠の上限(終了コード {rc})。別のモデル・有料枠には切り替えない。時間を置いて再試行")
     if rc in (42, 44, 52, 55):
-        return Hold("config", f"Gemini CLI の設定・入力の問題(終了コード {rc}): {msg[:160]}")
-    return Hold("api", f"Gemini の呼び出しに失敗(終了コード {rc}): {msg[:160] or (stderr or '')[-160:]}")
+        return Hold("config", f"Gemini CLI の設定・入力の問題(終了コード {rc})。詳細の原文は表示・保存しない")
+    return Hold("api", f"Gemini の呼び出しに失敗(終了コード {rc})。詳細の原文は表示・保存しない")
 
 
 # --- 記録 -------------------------------------------------------------------------

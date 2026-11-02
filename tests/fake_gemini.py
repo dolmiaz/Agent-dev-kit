@@ -60,6 +60,12 @@ if mode == "auth":
     print(json.dumps({"error": {"type": "FatalAuthenticationError", "message": "Please set an Auth method", "code": 41}}),
           file=sys.stderr)
     sys.exit(41)
+if mode == "echo-key":
+    print(json.dumps({"error": {"message": os.environ.get("GEMINI_API_KEY", ""), "code": 52}}), file=sys.stderr)
+    sys.exit(52)
+if mode == "private-error":
+    print(json.dumps({"error": {"message": "SYNTHETIC-PRIVATE-CLI-DIAGNOSTIC", "code": 52}}), file=sys.stderr)
+    sys.exit(52)
 if mode == "quota":
     print(json.dumps({"error": {"type": "ApiError", "message": "RESOURCE_EXHAUSTED: quota exceeded", "code": 429}}),
           file=sys.stderr)

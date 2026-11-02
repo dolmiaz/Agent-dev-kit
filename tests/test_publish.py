@@ -239,6 +239,26 @@ def t_failures():
     local()
 
 
+@test("CLI がキーや非公開の詳細をエラーに返しても、画面と記録へ原文を残さない")
+def t_safe_cli_errors():
+    for name, forbidden, kind in (("echo-key", ENV["MY_GEMINI_KEY"], "secret-output"),
+                                  ("private-error", "SYNTHETIC-PRIVATE-CLI-DIAGNOSTIC", "config")):
+        mode(name); clear_log()
+        rc, out = pub("polish", "--kind", "pr-body", "--file", draft("safe-error.md", BODY))
+        rec = record(rid_of(out))
+        assert rc == 3 and rec["hold_kind"] == kind, out
+        assert forbidden not in out and forbidden not in json.dumps(rec), "診断の原文を出力または記録した"
+    (GH / "fake-version").write_text(ENV["MY_GEMINI_KEY"])
+    try:
+        mode("ok"); clear_log()
+        rc, out = pub("polish", "--kind", "pr-body", "--file", draft("safe-version.md", BODY))
+        rec = record(rid_of(out))
+        assert rc == 3 and rec["hold_kind"] == "secret-output" and not calls(), out
+        assert ENV["MY_GEMINI_KEY"] not in out + json.dumps(rec)
+    finally:
+        (GH / "fake-version").unlink(missing_ok=True)
+
+
 @test("設定の不足: モデル名が別名・無い、版が違う、API キーが無いなら送らず保留")
 def t_config():
     for kw, kind in (({"AGENT_GEMINI_MODEL": "pro"}, "config"), ({"AGENT_GEMINI_MODEL": ""}, "config"),
